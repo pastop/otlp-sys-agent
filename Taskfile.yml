@@ -163,8 +163,8 @@ tasks:
         LimitNOFILE=65536
 
         # Разрешения для чтения iptables и сетевых счетчиков без root
-        CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
-        AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+        CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_READ_SEARCH
+        AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_READ_SEARCH
 
         [Install]
         WantedBy=multi-user.target

@@ -30,6 +30,8 @@ pub struct ParsedRule {
     pub match_comment: Option<String>,
     pub proto: Option<String>,
     pub dport: Option<String>,
+    pub src: Option<String>,
+    pub dst: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -212,6 +214,18 @@ fn parse_rule_line(line: &str, table: &str) -> Option<ParsedRule> {
                     i += 1;
                 }
             }
+            "-s" | "--source" => {
+                if i + 1 < tokens.len() {
+                    rule.src = Some(tokens[i + 1].clone());
+                    i += 1;
+                }
+            }
+            "-d" | "--destination" => {
+                if i + 1 < tokens.len() {
+                    rule.dst = Some(tokens[i + 1].clone());
+                    i += 1;
+                }
+            }
             _ => {}
         }
         i += 1;
@@ -341,6 +355,12 @@ impl Collector for IptablesCollector {
             }
             if let Some(dport) = rule.dport {
                 attrs.push(KeyValue::new("dport", dport));
+            }
+            if let Some(src) = rule.src {
+                attrs.push(KeyValue::new("src", src));
+            }
+            if let Some(dst) = rule.dst {
+                attrs.push(KeyValue::new("dst", dst));
             }
 
             rule_packets.add(rule.packets, &attrs);

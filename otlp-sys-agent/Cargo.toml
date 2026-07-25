@@ -1,0 +1,39 @@
+[package]
+name = "otlp-sys-agent"
+version = "0.1.1"
+edition = "2021"
+authors = ["Pastorov Nikita <pastopnik@gmail.com>","Google Gemini 3.5 Flash"]
+description = "Lightweight modular OTLP system metrics collector"
+
+[dependencies]
+# Async Runtime
+tokio = { version = "1.40", features = ["full"] }
+async-trait = "0.1"
+
+# OpenTelemetry & OTLP Exporter
+opentelemetry = { version = "0.27", features = ["metrics"] }
+opentelemetry_sdk = { version = "0.27", features = ["metrics", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", features = ["http-proto", "reqwest-client", "reqwest-rustls", "metrics"] }
+# opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic", "metrics"] }
+
+# Configuration & Environment
+config = "0.14"
+dotenvy = "0.15"
+serde = { version = "1.0", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+gethostname = "0.4"
+
+[profile.release]
+opt-level = "z"     # Оптимизация по размеру бинарника
+lto = true          # Link-Time Optimization для максимальной производительности
+codegen-units = 1   # Максимальная оптимизация при сборке
+panic = "abort"     # Убирает стэктрейсы из бинарника (уменьшает размер)
+strip = true        # Автоматически вырезает отладочные символы

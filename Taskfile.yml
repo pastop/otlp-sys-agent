@@ -1,0 +1,192 @@
+version: '3'
+
+vars:
+  APP_NAME: otlp-sys-agent
+  APP_USER: otlp-agent
+  PROJECT_DIR: otlp-sys-agent
+  DIST_DIR: dist
+  RELEASE_DIR: '{{.DIST_DIR}}/release'
+  TARGET_X86: x86_64-unknown-linux-musl
+  TARGET_ARM: aarch64-unknown-linux-musl
+
+tasks:
+  default:
+    desc: Полный цикл сборки релиза (тесты -> кросс-компиляция -> генерация скриптов -> архив)
+    deps: [release]
+
+  # --- СЕКЦИЯ РАЗРАБОТКИ (DEV) ---
+
+  dev:
+    desc: Запуск агента в режиме разработки (локально)
+    cmds:
+      - cargo run --manifest-path {{.PROJECT_DIR}}/Cargo.toml
+
+  test:
+    desc: Запуск юнит и интеграционных тестов Rust
+    cmds:
+      - cargo test --manifest-path {{.PROJECT_DIR}}/Cargo.toml --all-targets
+
+  clean:
+    desc: Очистка директории сборки dist и target
+    cmds:
+      - rm -rf {{.DIST_DIR}}
+      - cargo clean --manifest-path {{.PROJECT_DIR}}/Cargo.toml
+
+  # --- СЕКЦИЯ СБОРКИ (BUILD) ---
+
+  build:x86_64:
+    desc: Сборка статического бинарника для Linux x86_64 (musl)
+    cmds:
+      - mkdir -p {{.RELEASE_DIR}}/bin
+      - cargo zigbuild --manifest-path {{.PROJECT_DIR}}/Cargo.toml --release --target {{.TARGET_X86}}
+      - cp {{.PROJECT_DIR}}/target/{{.TARGET_X86}}/release/{{.APP_NAME}} {{.RELEASE_DIR}}/bin/{{.APP_NAME}}-x86_64
+
+  build:aarch64:
+    desc: Сборка статического бинарника для Linux ARM64 (musl)
+    cmds:
+      - mkdir -p {{.RELEASE_DIR}}/bin
+      - cargo zigbuild --manifest-path {{.PROJECT_DIR}}/Cargo.toml --release --target {{.TARGET_ARM}}
+      - cp {{.PROJECT_DIR}}/target/{{.TARGET_ARM}}/release/{{.APP_NAME}} {{.RELEASE_DIR}}/bin/{{.APP_NAME}}-aarch64
+
+  build:all:
+    desc: Сборка бинарников под все целевые архитектуры
+    deps: [build:x86_64, build:aarch64]
+
+  # --- СЕКЦИЯ ГЕНЕРАЦИИ РЕЛИЗНОГО ОКРУЖЕНИЯ ---
+
+  gen:install-script:
+    desc: Генерация инсталляционного bash-скрипта install.sh
+    cmds:
+      - mkdir -p {{.RELEASE_DIR}}
+      - |
+        cat << 'EOF' > {{.RELEASE_DIR}}/install.sh
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        APP_NAME="{{.APP_NAME}}"
+        USERNAME="{{.APP_USER}}"
+        CONFIG_DIR="/etc/${APP_NAME}"
+        BIN_TARGET="/usr/local/bin/${APP_NAME}"
+        SERVICE_TARGET="/etc/systemd/system/${APP_NAME}.service"
+
+        if [ "$EUID" -ne 0 ]; then
+            echo "[ERROR] Запустите скрипт установки с правами root (sudo ./install.sh)"
+            exit 1
+        fi
+
+        echo "=== Установка ${APP_NAME} ==="
+
+        # 1. Определение архитектуры
+        ARCH=$(uname -m)
+        case "${ARCH}" in
+            x86_64)
+                BIN_SRC="./bin/${APP_NAME}-x86_64"
+                ;;
+            aarch64|arm64)
+                BIN_SRC="./bin/${APP_NAME}-aarch64"
+                ;;
+            *)
+                echo "[ERROR] Неподдерживаемая архитектура: ${ARCH}"
+                exit 1
+                ;;
+        esac
+
+        if [ ! -f "${BIN_SRC}" ]; then
+            echo "[ERROR] Бинарный файл ${BIN_SRC} не найден в текущей директории!"
+            exit 1
+        fi
+
+        # 2. Создание системного пользователя
+        if id "$USERNAME" &>/dev/null; then
+            echo "[INFO] Пользователь '$USERNAME' уже существует."
+        else
+            echo "[INFO] Создание системного пользователя '$USERNAME'..."
+            useradd --system \
+                    --no-create-home \
+                    --shell /usr/bin/nologin \
+                    --comment "${APP_NAME} service user" \
+                    "$USERNAME"
+            echo "[OK] Пользователь создан."
+        fi
+
+        # 3. Копирование бинарника
+        echo "[INFO] Копирование бинарника в ${BIN_TARGET}..."
+        cp "${BIN_SRC}" "${BIN_TARGET}"
+        chmod 755 "${BIN_TARGET}"
+
+        # 4. Настройка конфига
+        echo "[INFO] Настройка конфигурации в ${CONFIG_DIR}..."
+        mkdir -p "${CONFIG_DIR}"
+        if [ -f "${CONFIG_DIR}/config.yaml" ]; then
+            echo "[WARN] Конфигурация ${CONFIG_DIR}/config.yaml уже существует. Пропускаем копирование."
+        else
+            cp ./config.yaml "${CONFIG_DIR}/config.yaml"
+            echo "[OK] Скопирован дефолтный config.yaml"
+        fi
+        chown -R root:"${USERNAME}" "${CONFIG_DIR}"
+        chmod 750 "${CONFIG_DIR}"
+        chmod 640 "${CONFIG_DIR}/config.yaml" 2>/dev/null || true
+
+        # 5. Установка systemd service
+        echo "[INFO] Установка unit-файла systemd..."
+        cp "./${APP_NAME}.service" "${SERVICE_TARGET}"
+        chmod 644 "${SERVICE_TARGET}"
+
+        # 6. Перезапуск systemd и запуск
+        echo "[INFO] Перезагрузка systemd и запуск сервиса..."
+        systemctl daemon-reload
+        systemctl enable --now "${APP_NAME}.service"
+
+        echo "=== Установка успешно завершена! ==="
+        systemctl status "${APP_NAME}.service" --no-pager
+        EOF
+      - chmod +x {{.RELEASE_DIR}}/install.sh
+
+  gen:systemd:
+    desc: Генерация unit-файла systemd
+    cmds:
+      - mkdir -p {{.RELEASE_DIR}}
+      - |
+        cat << 'EOF' > {{.RELEASE_DIR}}/{{.APP_NAME}}.service
+        [Unit]
+        Description=OTLP System Metrics Collector Agent
+        After=network.target
+
+        [Service]
+        Type=simple
+        User={{.APP_USER}}
+        Group={{.APP_USER}}
+        WorkingDirectory=/etc/{{.APP_NAME}}
+        ExecStart=/usr/local/bin/{{.APP_NAME}}
+        Restart=always
+        RestartSec=5s
+        LimitNOFILE=65536
+
+        # Разрешения для чтения iptables и сетевых счетчиков без root
+        CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+        AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+
+        [Install]
+        WantedBy=multi-user.target
+        EOF
+
+  gen:config:
+    desc: Копирование config.yaml в релиз
+    cmds:
+      - mkdir -p {{.RELEASE_DIR}}
+      - cp {{.PROJECT_DIR}}/config.yaml {{.RELEASE_DIR}}/config.yaml 2>/dev/null || true
+
+  gen:scripts:
+    deps: [gen:install-script, gen:systemd, gen:config]
+
+  # --- СЕКЦИЯ РЕЛИЗА (PROD) ---
+
+  release:
+    desc: Сборка релизного архива
+    deps:
+      - test
+      - 'build:all'
+      - gen:scripts
+    cmds:
+      - 'tar -czvf {{.DIST_DIR}}/{{.APP_NAME}}-release.tar.gz -C {{.RELEASE_DIR}} .'
+      - 'echo "Релиз собран: {{.DIST_DIR}}/{{.APP_NAME}}-release.tar.gz"'

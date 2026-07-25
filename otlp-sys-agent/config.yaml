@@ -1,0 +1,27 @@
+agent:
+  interval_secs: 10
+  log_level: "info"
+  host_name: "<hostname>"
+
+otlp:
+  endpoint: "<url>"
+  timeout_secs: 5
+
+collectors:
+  temperature:
+    enabled: true
+  iptables:
+    enabled: true
+    command: "iptables-save -c"
+    # 1. Собирать ли итоговую статистику по цепочкам (policy counters)
+    collect_chain_totals: true
+
+    # 2. Фильтрация правил (все поля опциональны, по умолчанию собирается ВСЁ)
+    # Если оставить пустым [], будут собираться вообще все действия (ACCEPT, DROP, REJECT и т.д.)
+    target_filter: [] # Пример: ["DROP", "REJECT"] — если нужны только блокировки
+
+    # Жёсткий режим: собирать только с комментариями/сетами (по умолчанию false!)
+    only_with_metadata: false
+
+    # Игнорировать служебные цепочки Docker, если они создают слишком много шума
+    ignore_chains: ["DOCKER-ISOLATION-STAGE-1", "DOCKER-ISOLATION-STAGE-2"]

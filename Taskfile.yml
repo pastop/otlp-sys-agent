@@ -19,7 +19,7 @@ tasks:
   dev:
     desc: Запуск агента в режиме разработки (можно передать CONFIG=/path/to/config.yaml)
     vars:
-      CFG: '{{.CONFIG | default "otlp-sys-agent/config.yaml"}}'
+      CFG: '{{.CONFIG | default (printf "%s/config.yaml" .PROJECT_DIR)}}'
     cmds:
       - CONFIG_PATH="{{.CFG}}" cargo run --manifest-path {{.PROJECT_DIR}}/Cargo.toml
 
@@ -100,13 +100,14 @@ tasks:
         if id "$USERNAME" &>/dev/null; then
             echo "[INFO] Пользователь '$USERNAME' уже существует."
         else
-            echo "[INFO] Создание системного пользователя '$USERNAME'..."
+            echo "[INFO] Создание системного пользователя и группы '$USERNAME'..."
             useradd --system \
+                    --user-group \
                     --no-create-home \
                     --shell /usr/bin/nologin \
                     --comment "${APP_NAME} service user" \
                     "$USERNAME"
-            echo "[OK] Пользователь создан."
+            echo "[OK] Пользователь и группа созданы."
         fi
 
         echo "[INFO] Копирование бинарника в ${BIN_TARGET}..."
@@ -170,7 +171,7 @@ tasks:
     desc: Копирование config.yaml в релиз
     cmds:
       - mkdir -p {{.RELEASE_DIR}}
-      - cp {{.PROJECT_DIR}}/config.yaml {{.RELEASE_DIR}}/config.yaml 2>/dev/null || true
+      - cp {{.PROJECT_DIR}}/config.yaml {{.RELEASE_DIR}}/config.yaml
 
   gen:scripts:
     deps: [gen:install-script, gen:systemd, gen:config]
@@ -198,11 +199,20 @@ tasks:
       - git push origin main
 
   git:release:
-    desc: Публикация нового релиза в GitHub Releases с прикрепленным архивом бинарников
-    deps: [release]
+    desc: Автоматическое поднятие версии, сборка и публикация релиза в GitHub Releases
     vars:
-      RELEASE_TAG: '{{.TAG | default "v0.1.2"}}'
+      RAW_TAG: '{{.TAG | default "v0.1.2"}}'
+      VER: '{{.RAW_TAG | trimPrefix "v"}}'
     cmds:
-      - git tag -a {{.RELEASE_TAG}} -m "Release {{.RELEASE_TAG}}"
-      - git push origin {{.RELEASE_TAG}}
-      - gh release create {{.RELEASE_TAG}} {{.DIST_DIR}}/{{.APP_NAME}}-release.tar.gz --title "Release {{.RELEASE_TAG}}" --notes "Автоматический релиз {{.RELEASE_TAG}}"
+      # 1. Обновляем версию строго в секции [package] Cargo.toml
+      - sed -i '0,/^version = .*/s//version = "{{.VER}}"/' {{.PROJECT_DIR}}/Cargo.toml
+      # 2. Фиксируем изменение версии в git
+      - git add {{.PROJECT_DIR}}/Cargo.toml
+      - 'git commit -m "chore: bump version to {{.VER}}" || true'
+      - git push origin main
+      # 3. Пересобираем релизные бинарники под обновленную версию
+      - task: release
+      # 4. Проставляем тег и публикуем в GitHub
+      - git tag -f -a {{.RAW_TAG}} -m "Release {{.RAW_TAG}}"
+      - git push origin {{.RAW_TAG}} --force
+      - gh release create {{.RAW_TAG}} {{.DIST_DIR}}/{{.APP_NAME}}-release.tar.gz --title "Release {{.RAW_TAG}}" --notes "Автоматический релиз {{.RAW_TAG}}" --clobber

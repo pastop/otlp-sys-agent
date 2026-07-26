@@ -17,9 +17,11 @@ tasks:
   # --- СЕКЦИЯ РАЗРАБОТКИ (DEV) ---
 
   dev:
-    desc: Запуск агента в режиме разработки (локально)
+    desc: Запуск агента в режиме разработки (можно передать CONFIG=/path/to/config.yaml)
+    vars:
+      CFG: '{{.CONFIG | default "otlp-sys-agent/config.yaml"}}'
     cmds:
-      - cargo run --manifest-path {{.PROJECT_DIR}}/Cargo.toml
+      - CONFIG_PATH="{{.CFG}}" cargo run --manifest-path {{.PROJECT_DIR}}/Cargo.toml
 
   test:
     desc: Запуск юнит и интеграционных тестов Rust
@@ -76,7 +78,6 @@ tasks:
 
         echo "=== Установка ${APP_NAME} ==="
 
-        # 1. Определение архитектуры
         ARCH=$(uname -m)
         case "${ARCH}" in
             x86_64)
@@ -96,7 +97,6 @@ tasks:
             exit 1
         fi
 
-        # 2. Создание системного пользователя
         if id "$USERNAME" &>/dev/null; then
             echo "[INFO] Пользователь '$USERNAME' уже существует."
         else
@@ -109,12 +109,10 @@ tasks:
             echo "[OK] Пользователь создан."
         fi
 
-        # 3. Копирование бинарника
         echo "[INFO] Копирование бинарника в ${BIN_TARGET}..."
         cp "${BIN_SRC}" "${BIN_TARGET}"
         chmod 755 "${BIN_TARGET}"
 
-        # 4. Настройка конфига
         echo "[INFO] Настройка конфигурации в ${CONFIG_DIR}..."
         mkdir -p "${CONFIG_DIR}"
         if [ -f "${CONFIG_DIR}/config.yaml" ]; then
@@ -127,12 +125,10 @@ tasks:
         chmod 750 "${CONFIG_DIR}"
         chmod 640 "${CONFIG_DIR}/config.yaml" 2>/dev/null || true
 
-        # 5. Установка systemd service
         echo "[INFO] Установка unit-файла systemd..."
         cp "./${APP_NAME}.service" "${SERVICE_TARGET}"
         chmod 644 "${SERVICE_TARGET}"
 
-        # 6. Перезапуск systemd и запуск
         echo "[INFO] Перезагрузка systemd и запуск сервиса..."
         systemctl daemon-reload
         systemctl enable --now "${APP_NAME}.service"
@@ -162,7 +158,7 @@ tasks:
         RestartSec=5s
         LimitNOFILE=65536
 
-        # Разрешения для чтения iptables и сетевых счетчиков без root
+        # Права для чтения iptables, сетевых счетчиков и статусов /proc без root
         CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_READ_SEARCH
         AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_READ_SEARCH
 
@@ -179,10 +175,10 @@ tasks:
   gen:scripts:
     deps: [gen:install-script, gen:systemd, gen:config]
 
-  # --- СЕКЦИЯ РЕЛИЗА (PROD) ---
+  # --- СЕКЦИЯ РЕЛИЗА И ПУБЛИКАЦИИ (PROD / GIT) ---
 
   release:
-    desc: Сборка релизного архива
+    desc: Сборка релизного архива (Строго после успешного прохождения тестов)
     deps:
       - test
       - 'build:all'
@@ -190,3 +186,23 @@ tasks:
     cmds:
       - 'tar -czvf {{.DIST_DIR}}/{{.APP_NAME}}-release.tar.gz -C {{.RELEASE_DIR}} .'
       - 'echo "Релиз собран: {{.DIST_DIR}}/{{.APP_NAME}}-release.tar.gz"'
+
+  git:push:
+    desc: Безопасный коммит и пуш исходного кода в Git (блокируется при падении тестов)
+    deps: [test]
+    vars:
+      COMMIT_MSG: '{{.MSG | default "chore: update agent codebase"}}'
+    cmds:
+      - git add .
+      - git commit -m "{{.COMMIT_MSG}}"
+      - git push origin main
+
+  git:release:
+    desc: Публикация нового релиза в GitHub Releases с прикрепленным архивом бинарников
+    deps: [release]
+    vars:
+      RELEASE_TAG: '{{.TAG | default "v0.1.2"}}'
+    cmds:
+      - git tag -a {{.RELEASE_TAG}} -m "Release {{.RELEASE_TAG}}"
+      - git push origin {{.RELEASE_TAG}}
+      - gh release create {{.RELEASE_TAG}} {{.DIST_DIR}}/{{.APP_NAME}}-release.tar.gz --title "Release {{.RELEASE_TAG}}" --notes "Автоматический релиз {{.RELEASE_TAG}}"

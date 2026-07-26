@@ -30,6 +30,7 @@ anyhow = "1.0"
 thiserror = "2.0"
 
 gethostname = "0.4"
+serde_yaml = "0.9.34"
 
 [profile.release]
 opt-level = "z"     # Оптимизация по размеру бинарника
@@ -37,3 +38,6 @@ lto = true          # Link-Time Optimization для максимальной п�
 codegen-units = 1   # Максимальная оптимизация при сборке
 panic = "abort"     # Убирает стэктрейсы из бинарника (уменьшает размер)
 strip = true        # Автоматически вырезает отладочные символы
+
+[dev-dependencies]
+tempfile = "3.10"

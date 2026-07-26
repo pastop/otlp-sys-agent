@@ -2,6 +2,7 @@ use anyhow::Result;
 use opentelemetry::metrics::MeterProvider;
 use otlp_sys_agent::collector::CollectorRegistry;
 use otlp_sys_agent::collectors::iptables::IptablesCollector;
+use otlp_sys_agent::collectors::process::ProcessCollector;
 use otlp_sys_agent::collectors::temperature::SysfsTempCollector;
 use otlp_sys_agent::config::AppConfig;
 use otlp_sys_agent::telemetry;
@@ -39,16 +40,21 @@ async fn main() -> Result<()> {
     let mut registry = CollectorRegistry::new();
 
     if cfg.collectors.temperature.enabled {
-            registry.register(SysfsTempCollector::new(hostname.clone()));
-        }
+        registry.register(SysfsTempCollector::new(hostname.clone()));
+    }
 
     // Регистрация iptables коллектора
     if cfg.collectors.iptables.enabled {
-            registry.register(IptablesCollector::new(
-                cfg.collectors.iptables.clone(),
-                hostname.clone(),
-            ));
-        }
+        registry.register(IptablesCollector::new(
+            cfg.collectors.iptables.clone(),
+            hostname.clone(),
+        ));
+    }
+
+    // Регистрация process коллектора
+    if cfg.collectors.process.enabled {
+        registry.register(ProcessCollector::new(hostname.clone()));
+    }
 
     if registry.is_empty() {
         warn!("Нет активных коллекторов в конфигурации! Завершение работы.");

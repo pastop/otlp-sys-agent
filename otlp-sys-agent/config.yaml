@@ -25,3 +25,19 @@ collectors:
 
     # Игнорировать служебные цепочки Docker, если они создают слишком много шума
     ignore_chains: ["DOCKER-ISOLATION-STAGE-1", "DOCKER-ISOLATION-STAGE-2"]
+  process:
+    enabled: true
+    # 1. Фильтры процессов (если include_processes пуст — собираются все)
+    include_processes: []
+    exclude_processes: ["kworker/*"]
+
+    # 2. Фильтр по systemd units (если пуст — определяются автоматически для всех процессов)
+    track_systemd_units: []
+
+    # 3. Дополнительные метрики
+    collect_io: true
+    collect_fds: true
+
+    # 4. Пороги отсечения "шумных" мелких процессов
+    min_cpu_percent: 0.0
+    min_memory_mb: 0

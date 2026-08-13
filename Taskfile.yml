@@ -215,4 +215,5 @@ tasks:
       # 4. Проставляем тег и публикуем в GitHub
       - git tag -f -a {{.RAW_TAG}} -m "Release {{.RAW_TAG}}"
       - git push origin {{.RAW_TAG}} --force
-      - gh release create {{.RAW_TAG}} {{.DIST_DIR}}/{{.APP_NAME}}-release.tar.gz --title "Release {{.RAW_TAG}}" --notes "Автоматический релиз {{.RAW_TAG}}" --clobber
+      # - gh release create {{.RAW_TAG}} {{.DIST_DIR}}/{{.APP_NAME}}-release.tar.gz --title "Release {{.RAW_TAG}}" --notes "Автоматический релиз {{.RAW_TAG}}" --clobber
+      - gh release create {{.RAW_TAG}} {{.DIST_DIR}}/{{.APP_NAME}}-release.tar.gz --title "Release {{.RAW_TAG}}" --notes "Автоматический релиз {{.RAW_TAG}}"

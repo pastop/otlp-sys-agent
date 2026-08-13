@@ -6,6 +6,8 @@ use otlp_sys_agent::collectors::process::ProcessCollector;
 use otlp_sys_agent::collectors::temperature::SysfsTempCollector;
 use otlp_sys_agent::collectors::filesystem::FilesystemCollector;
 use otlp_sys_agent::collectors::disk::DiskCollector;
+use otlp_sys_agent::collectors::network::NetworkCollector;
+
 
 use otlp_sys_agent::config::AppConfig;
 use otlp_sys_agent::telemetry;
@@ -72,9 +74,18 @@ async fn main() -> Result<()> {
         ));
     }
 
+    // Регистрация Disk коллектора
     if cfg.collectors.disk.enabled {
         registry.register(DiskCollector::new(
             cfg.collectors.disk.clone(),
+            hostname.clone(),
+        ));
+    }
+
+    // Регистрация Network коллектора
+    if cfg.collectors.network.enabled {
+        registry.register(NetworkCollector::new(
+            cfg.collectors.network.clone(),
             hostname.clone(),
         ));
     }

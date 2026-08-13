@@ -59,3 +59,16 @@ collectors:
       ignore_device_mapper: true    # Игнорировать LVM (dm-0, dm-1)
       ignore_devices: []            # Пример: ["sr0"] для CD-ROM
       collect_io: true              # Собирать read/write counters
+  network:
+      enabled: true
+      ignore_interfaces:
+        - lo
+        - veth
+        - docker
+        - br-
+        - virbr
+        - tun
+        - tap
+        - wg
+      ignore_exact: []
+      collect_ip: true

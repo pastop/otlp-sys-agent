@@ -180,3 +180,29 @@ rate(system_disk_io_io_time_ms[5m]) / 10
 # IOPS (операций в секунду)
 rate(system_disk_io_reads_completed[5m]) + rate(system_disk_io_writes_completed[5m])
 ```
+
+##  Пример PromQL запросов для Grafana для Network
+```
+# Скорость RX на выбранном uplink-интерфейсе (bit/s)
+rate(system_network_io_rx_bytes{interface="$interface"}[1m]) * 8
+
+# Скорость TX
+rate(system_network_io_tx_bytes{interface="$interface"}[1m]) * 8
+
+# Процент использования линка (если скорость известна)
+(
+  rate(system_network_io_rx_bytes{interface="$interface"}[1m]) * 8
+  / on(interface) group_left() 
+  (system_network_info * 1000000)  # speed_mbps -> bps
+) * 100
+
+# Ошибки на интерфейсе (rate в секунду)
+rate(system_network_io_rx_errors{interface="$interface"}[5m])
++ rate(system_network_io_tx_errors{interface="$interface"}[5m])
+
+# Drops (сигнал перегрузки буферов)
+rate(system_network_io_rx_dropped{interface="$interface"}[5m])
+
+# Таблица всех серверов и их uplink-интерфейсов
+system_network_info{speed_mbps!="unknown"}
+```

@@ -129,6 +129,9 @@ pub struct CollectorsConfig {
 
     #[serde(default)]
     pub disk: DiskConfig,
+
+    #[serde(default)]
+    pub network: NetworkConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -193,6 +196,8 @@ impl Default for ProcessConfig {
     }
 }
 
+// DiskConfig:
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct DiskConfig {
     #[serde(default = "default_true")]
@@ -219,7 +224,51 @@ impl Default for DiskConfig {
     }
 }
 
-// После ProcessConfig:
+// NetworkConfig:
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct NetworkConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Префиксы интерфейсов для игнорирования
+    #[serde(default = "default_ignore_interfaces")]
+    pub ignore_interfaces: Vec<String>,
+    /// Точные имена интерфейсов для игнорирования
+    #[serde(default)]
+    pub ignore_exact: Vec<String>,
+    /// Собирать IP-адреса (требует getifaddrs)
+    #[serde(default = "default_true")]
+    pub collect_ip: bool,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ignore_interfaces: default_ignore_interfaces(),
+            ignore_exact: Vec::new(),
+            collect_ip: true,
+        }
+    }
+}
+
+fn default_ignore_interfaces() -> Vec<String> {
+    vec![
+        "lo".to_string(),
+        "veth".to_string(),
+        "docker".to_string(),
+        "br-".to_string(),
+        "virbr".to_string(),
+        "vnet".to_string(),
+        "tun".to_string(),
+        "tap".to_string(),
+        "wg".to_string(),
+        "cni".to_string(),
+        "flannel".to_string(),
+    ]
+}
+
+// FilesystemConfig:
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct FilesystemConfig {

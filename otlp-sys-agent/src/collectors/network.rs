@@ -21,6 +21,7 @@ pub struct NetworkInterfaceInfo {
     pub speed_mbps: Option<u64>,
     pub duplex: Option<String>,
     pub operstate: String,
+    pub flags: u32,          // <-- ДОБАВЛЕНО
     pub ipv4: Vec<String>,
     pub ipv6: Vec<String>,
 }
@@ -78,6 +79,32 @@ pub fn parse_operstate(raw: &str) -> String {
         "unknown".to_string()
     } else {
         s.to_string()
+    }
+}
+
+/// Парсит hex-флаги интерфейса из sysfs.
+/// Пример: "0x11091" -> 0x11091
+pub fn parse_interface_flags(raw: &str) -> u32 {
+    let s = raw.trim();
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    u32::from_str_radix(s, 16).unwrap_or(0)
+}
+
+/// Определяет, UP ли интерфейс, по operstate и флагам.
+///
+/// Логика:
+/// - operstate == "up" → UP
+/// - operstate == "down" → DOWN
+/// - operstate == "unknown" → проверяем флаг IFF_UP (0x1)
+///   (PPP, bridge и другие интерфейсы без carrier detection)
+pub fn is_interface_up(operstate: &str, flags: u32) -> bool {
+    match operstate {
+        "up" => true,
+        "down" => false,
+        _ => {
+            // IFF_UP = 0x1
+            (flags & 0x1) != 0
+        }
     }
 }
 
@@ -169,7 +196,6 @@ fn is_ipv6_link_local(ip: &Ipv6Addr) -> bool {
     (seg[0] & 0xffc0) == 0xfe80
 }
 
-
 /// Читает sysfs-статистику из директории /sys/class/net/<iface>/statistics/
 fn read_interface_statistics(iface_path: &Path) -> NetworkIoStats {
     let stats_dir = iface_path.join("statistics");
@@ -237,6 +263,11 @@ pub fn collect_network_info(config: &NetworkConfig) -> Vec<NetworkInterfaceInfo>
             .map(|s| parse_operstate(&s))
             .unwrap_or_else(|| "unknown".to_string());
 
+        // Flags (для определения UP на PPP и других интерфейсах с operstate=unknown)
+        let flags = read_sys_str(&iface_path.join("flags"))
+            .map(|s| parse_interface_flags(&s))
+            .unwrap_or(0);
+
         // IP адреса
         let (ipv4, ipv6) = ip_map
             .get(&name)
@@ -249,6 +280,7 @@ pub fn collect_network_info(config: &NetworkConfig) -> Vec<NetworkInterfaceInfo>
             speed_mbps,
             duplex,
             operstate,
+            flags,       // <-- ДОБАВЛЕНО
             ipv4,
             ipv6,
         });
@@ -318,25 +350,25 @@ impl Collector for NetworkCollector {
         for iface in &interfaces {
             // Объединяем IP адреса через запятую (Prometheus label может содержать строки)
             let ipv4_str = if iface.ipv4.is_empty() {
-                    "none".to_string()
-                } else {
-                    iface.ipv4.join(",")
-                };
+                "none".to_string()
+            } else {
+                iface.ipv4.join(",")
+            };
             let ipv6_str = if iface.ipv6.is_empty() {
-                    "none".to_string()
-                } else {
-                    iface.ipv6.join(",")
-                };
+                "none".to_string()
+            } else {
+                iface.ipv6.join(",")
+            };
             let speed_str = iface
                 .speed_mbps
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| "unknown".to_string());
             let duplex_str = iface.duplex.clone().unwrap_or_else(|| "unknown".to_string());
             let mac_str = if iface.mac.is_empty() {
-                    "unknown".to_string()
-                } else {
-                    iface.mac.clone()
-                };
+                "unknown".to_string()
+            } else {
+                iface.mac.clone()
+            };
 
             let attrs = [
                 KeyValue::new("host_name", self.hostname.clone()),
@@ -372,7 +404,8 @@ impl Collector for NetworkCollector {
                 KeyValue::new("host_name", self.hostname.clone()),
                 KeyValue::new("interface", iface.name.clone()),
             ];
-            let value: f64 = if iface.operstate == "up" { 1.0 } else { 0.0 };
+            // ✅ Теперь используем комбинированную проверку operstate + flags
+            let value: f64 = if is_interface_up(&iface.operstate, iface.flags) { 1.0 } else { 0.0 };
             up_gauge.record(value, &attrs);
         }
 

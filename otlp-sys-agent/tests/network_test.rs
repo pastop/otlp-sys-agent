@@ -1,8 +1,8 @@
 // tests/network_test.rs
 
 use otlp_sys_agent::collectors::network::{
-    collect_network_info, parse_duplex, parse_mac, parse_operstate, parse_speed_mbps,
-    parse_statistics, should_skip_interface, NetworkIoStats,
+    collect_network_info, is_interface_up, parse_duplex, parse_interface_flags, parse_mac,
+    parse_operstate, parse_speed_mbps, parse_statistics, should_skip_interface, NetworkIoStats,
 };
 use otlp_sys_agent::config::NetworkConfig;
 use std::collections::HashMap;
@@ -57,6 +57,83 @@ fn test_parse_operstate() {
     assert_eq!(parse_operstate("down"), "down");
     assert_eq!(parse_operstate("unknown"), "unknown");
     assert_eq!(parse_operstate(""), "unknown");
+}
+
+// ─── parse_interface_flags ───
+
+#[test]
+fn test_parse_flags_with_prefix() {
+    assert_eq!(parse_interface_flags("0x11091"), 0x11091);
+}
+
+#[test]
+fn test_parse_flags_without_prefix() {
+    assert_eq!(parse_interface_flags("11091"), 0x11091);
+}
+
+#[test]
+fn test_parse_flags_with_whitespace() {
+    assert_eq!(parse_interface_flags("  0x1091\n"), 0x1091);
+}
+
+#[test]
+fn test_parse_flags_empty() {
+    assert_eq!(parse_interface_flags(""), 0);
+}
+
+#[test]
+fn test_parse_flags_invalid() {
+    assert_eq!(parse_interface_flags("not_hex"), 0);
+}
+
+// ─── is_interface_up ───
+
+#[test]
+fn test_up_operstate_is_up() {
+    assert!(is_interface_up("up", 0));
+}
+
+#[test]
+fn test_down_operstate_is_down() {
+    assert!(!is_interface_up("down", 0x11091));
+}
+
+#[test]
+fn test_unknown_with_iff_up_is_up() {
+    // PPP: operstate=unknown, но IFF_UP установлен
+    // ppp0: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP>
+    // 0x1 (UP) | 0x10 (POINTOPOINT) | 0x80 (NOARP) | 0x1000 (MULTICAST) | 0x10000 (LOWER_UP)
+    let flags = 0x11091;
+    assert!(is_interface_up("unknown", flags));
+}
+
+#[test]
+fn test_unknown_without_iff_up_is_down() {
+    // Интерфейс выключен: operstate=unknown, IFF_UP не установлен
+    // Только POINTOPOINT | NOARP | MULTICAST, без IFF_UP
+    let flags = 0x11080;
+    assert!(!is_interface_up("unknown", flags));
+}
+
+#[test]
+fn test_unknown_with_only_iff_up() {
+    // Только IFF_UP, без LOWER_UP (интерфейс поднят, но кабель не подключён)
+    assert!(is_interface_up("unknown", 0x1));
+}
+
+#[test]
+fn test_lowerlayerdown_state_checks_flags() {
+    // operstate=lowerlayerdown → проверяем флаги
+    let flags_up = 0x1; // IFF_UP
+    assert!(is_interface_up("lowerlayerdown", flags_up));
+
+    let flags_down = 0x0;
+    assert!(!is_interface_up("lowerlayerdown", flags_down));
+}
+
+#[test]
+fn test_zero_flags_is_down() {
+    assert!(!is_interface_up("unknown", 0));
 }
 
 // ─── should_skip_interface ───
@@ -168,12 +245,12 @@ fn test_collect_network_info_integration() {
         ignore_interfaces: vec!["lo".to_string()], // убираем loopback для чистоты
         ignore_exact: vec![],
         collect_ip: true,
+        ..Default::default()
     };
 
     let interfaces = collect_network_info(&config);
 
     // На любой Linux-системе должен быть хотя бы один не-loopback интерфейс
-    // (даже если это виртуальный)
     assert!(
         !interfaces.is_empty(),
         "Ожидается хотя бы один сетевой интерфейс"
@@ -200,6 +277,7 @@ fn test_collect_network_info_without_ip() {
         ignore_interfaces: vec!["lo".to_string()],
         ignore_exact: vec![],
         collect_ip: false,
+        ..Default::default()
     };
 
     let interfaces = collect_network_info(&config);
@@ -207,5 +285,31 @@ fn test_collect_network_info_without_ip() {
     for iface in &interfaces {
         assert!(iface.ipv4.is_empty(), "IPv4 не должен собираться");
         assert!(iface.ipv6.is_empty(), "IPv6 не должен собираться");
+    }
+}
+
+#[test]
+fn test_collect_network_info_flags_populated() {
+    let config = NetworkConfig {
+        enabled: true,
+        ignore_interfaces: vec!["lo".to_string()],
+        ignore_exact: vec![],
+        collect_ip: false,
+        ..Default::default()
+    };
+
+    let interfaces = collect_network_info(&config);
+
+    // Проверяем, что флаги прочитаны (не все нулевые для UP интерфейсов)
+    for iface in &interfaces {
+        if iface.operstate == "up" {
+            // UP интерфейс должен иметь IFF_UP флаг
+            assert!(
+                iface.flags & 0x1 != 0,
+                "Интерфейс {} в состоянии up, но IFF_UP не установлен (flags=0x{:x})",
+                iface.name,
+                iface.flags
+            );
+        }
     }
 }

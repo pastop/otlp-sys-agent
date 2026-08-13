@@ -4,6 +4,9 @@ use otlp_sys_agent::collector::CollectorRegistry;
 use otlp_sys_agent::collectors::iptables::IptablesCollector;
 use otlp_sys_agent::collectors::process::ProcessCollector;
 use otlp_sys_agent::collectors::temperature::SysfsTempCollector;
+use otlp_sys_agent::collectors::filesystem::FilesystemCollector;
+use otlp_sys_agent::collectors::disk::DiskCollector;
+
 use otlp_sys_agent::config::AppConfig;
 use otlp_sys_agent::telemetry;
 use std::time::Duration;
@@ -59,6 +62,21 @@ async fn main() -> Result<()> {
     if registry.is_empty() {
         warn!("Нет активных коллекторов в конфигурации! Завершение работы.");
         return Ok(());
+    }
+
+    // Регистрация filesystem коллектора
+    if cfg.collectors.filesystem.enabled {
+        registry.register(FilesystemCollector::new(
+            cfg.collectors.filesystem.clone(),
+            hostname.clone(),
+        ));
+    }
+
+    if cfg.collectors.disk.enabled {
+        registry.register(DiskCollector::new(
+            cfg.collectors.disk.clone(),
+            hostname.clone(),
+        ));
     }
 
     // 5. Главный асинхронный цикл сбора

@@ -123,6 +123,12 @@ pub struct CollectorsConfig {
 
     #[serde(default)]
     pub process: ProcessConfig,
+
+    #[serde(default)]
+    pub filesystem: FilesystemConfig,
+
+    #[serde(default)]
+    pub disk: DiskConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -185,6 +191,91 @@ impl Default for ProcessConfig {
     fn default() -> Self {
         Self { enabled: true }
     }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct DiskConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Игнорировать device-mapper устройства (dm-0, dm-1 — LVM)
+    #[serde(default = "default_true")]
+    pub ignore_device_mapper: bool,
+    /// Список устройств для игнорирования
+    #[serde(default)]
+    pub ignore_devices: Vec<String>,
+    /// Собирать I/O статистику (read/write counters)
+    #[serde(default = "default_true")]
+    pub collect_io: bool,
+}
+
+impl Default for DiskConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ignore_device_mapper: true,
+            ignore_devices: Vec::new(),
+            collect_io: true,
+        }
+    }
+}
+
+// После ProcessConfig:
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct FilesystemConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_ignore_mount_points")]
+    pub ignore_mount_points: Vec<String>,
+    #[serde(default = "default_ignore_fs_types")]
+    pub ignore_fs_types: Vec<String>,
+}
+
+impl Default for FilesystemConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ignore_mount_points: default_ignore_mount_points(),
+            ignore_fs_types: default_ignore_fs_types(),
+        }
+    }
+}
+
+fn default_ignore_mount_points() -> Vec<String> {
+    vec![
+        "/proc".to_string(),
+        "/sys".to_string(),
+        "/dev".to_string(),
+        "/run".to_string(),
+        "/snap".to_string(),
+    ]
+}
+
+fn default_ignore_fs_types() -> Vec<String> {
+    vec![
+        "tmpfs".to_string(),
+        "devtmpfs".to_string(),
+        "squashfs".to_string(),
+        "overlay".to_string(),
+        "proc".to_string(),
+        "sysfs".to_string(),
+        "cgroup".to_string(),
+        "cgroup2".to_string(),
+        "devpts".to_string(),
+        "mqueue".to_string(),
+        "hugetlbfs".to_string(),
+        "debugfs".to_string(),
+        "tracefs".to_string(),
+        "securityfs".to_string(),
+        "pstore".to_string(),
+        "bpf".to_string(),
+        "autofs".to_string(),
+        "binfmt_misc".to_string(),
+        "rpc_pipefs".to_string(),
+        "nsfs".to_string(),
+        "ramfs".to_string(),
+        "fuse.lxcfs".to_string(),
+    ]
 }
 
 fn default_true() -> bool {

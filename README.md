@@ -140,3 +140,43 @@ task release
 (Скомпилирует бинарники под x86_64 и ARM64 через Zig, сгенерирует `install.sh`, `systemd.service` и упакует всё в `dist/otlp-sys-agent-release.tar.gz`).
 
 ## Пример дашборда представлен в `GrafanaDashBoardExample.json` и `GrafanaCPUTempDashBoardExample.json`
+
+
+##  Пример PromQL запросов для Grafana для filesystem
+```
+# Общий объём диска (в GB)
+system_filesystem_total_bytes{host_name="server-01", mountpoint="/"} / 1024/1024/1024
+
+# Занято (в GB)
+system_filesystem_used_bytes{host_name="server-01", mountpoint="/"} / 1024/1024/1024
+
+# Свободно (в GB)
+system_filesystem_free_bytes{host_name="server-01", mountpoint="/"} / 1024/1024/1024
+
+# Резерв (неразмеченное место root)
+system_filesystem_reserved_bytes{host_name="server-01"} / 1024/1024/1024
+
+# Процент использования диска
+100 * (system_filesystem_used_bytes / system_filesystem_total_bytes)
+
+# Список всех серверов и их точек монтирования
+group by (host_name, mountpoint, fstype) (system_filesystem_total_bytes)
+```
+
+##  Пример PromQL запросов для Grafana для disk
+```
+# Неразмеченное место на дисках (GB)
+system_disk_unallocated_bytes / 1024/1024/1024
+
+# Скорость чтения с диска (MB/s)
+rate(system_disk_io_read_bytes[5m]) / 1024/1024
+
+# Скорость записи на диск (MB/s)
+rate(system_disk_io_write_bytes[5m]) / 1024/1024
+
+# Утилизация диска (% времени занят)
+rate(system_disk_io_io_time_ms[5m]) / 10
+
+# IOPS (операций в секунду)
+rate(system_disk_io_reads_completed[5m]) + rate(system_disk_io_writes_completed[5m])
+```

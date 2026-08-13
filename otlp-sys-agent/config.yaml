@@ -41,3 +41,21 @@ collectors:
     # 4. Пороги отсечения "шумных" мелких процессов
     min_cpu_percent: 0.0
     min_memory_mb: 0
+  filesystem:
+      enabled: true
+      ignore_mount_points:
+        - /proc
+        - /sys
+        - /dev
+        - /run
+        - /snap
+      ignore_fs_types:
+        - tmpfs
+        - devtmpfs
+        - squashfs
+        - overlay
+  disk:
+      enabled: true
+      ignore_device_mapper: true    # Игнорировать LVM (dm-0, dm-1)
+      ignore_devices: []            # Пример: ["sr0"] для CD-ROM
+      collect_io: true              # Собирать read/write counters

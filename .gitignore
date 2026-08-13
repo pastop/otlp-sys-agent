@@ -22,3 +22,4 @@ Cargo.lock
 
 # System files
 .DS_Store
+otlp-sys-agent/.tree.txt

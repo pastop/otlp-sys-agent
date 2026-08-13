@@ -1,6 +1,6 @@
 [package]
 name = "otlp-sys-agent"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 authors = ["Pastorov Nikita <pastopnik@gmail.com>","Google Gemini 3.5 Flash"]
 description = "Lightweight modular OTLP system metrics collector"
@@ -11,13 +11,12 @@ tokio = { version = "1.40", features = ["full"] }
 async-trait = "0.1"
 
 # OpenTelemetry & OTLP Exporter
-opentelemetry = { version = "0.27", features = ["metrics"] }
-opentelemetry_sdk = { version = "0.27", features = ["metrics", "rt-tokio"] }
-opentelemetry-otlp = { version = "0.27", features = ["http-proto", "reqwest-client", "reqwest-rustls", "metrics"] }
-# opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic", "metrics"] }
+opentelemetry = { version = "0.32.0", features = ["metrics"] }
+opentelemetry_sdk = { version = "0.32.1", features = ["metrics", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.32.0", features = ["http-proto", "reqwest-blocking-client", "reqwest-rustls", "metrics"] }
 
 # Configuration & Environment
-config = "0.14"
+config = "0.15.25"
 dotenvy = "0.15"
 serde = { version = "1.0", features = ["derive"] }
 
@@ -27,10 +26,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Error handling
 anyhow = "1.0"
-thiserror = "2.0"
+thiserror = "2.0.20"
 
-gethostname = "0.4"
+gethostname = "1.1.0"
 serde_yaml = "0.9.34"
+
+nix = { version = "0.31.3", features = ["fs"] }
 
 [profile.release]
 opt-level = "z"     # Оптимизация по размеру бинарника

@@ -48,9 +48,12 @@ otlp-sys-agent/
         collector.rs
         mod.rs
         procfs.rs
+      disk.rs
       filesystem.rs
       iptables.rs
       mod.rs
+      network.rs
+      system.rs
       temperature.rs
     collector.rs
     config.rs
@@ -58,8 +61,12 @@ otlp-sys-agent/
     main.rs
     telemetry.rs
   tests/
+    disk_test.rs
+    filesystem_test.rs
     iptables_test.rs
+    network_test.rs
     procfs_test.rs
+    system_test.rs
   .env.example
   .gitignore
   Cargo.toml
@@ -75,71 +82,6 @@ Taskfile.yml
 
 <files>
 This section contains the contents of the repository's files.
-
-<file path="otlp-sys-agent/src/collectors/filesystem.rs">
-use nix::sys::statvfs::{statvfs, FsFlags};
-use std::fs;
-use std::path::Path;
-
-#[derive(Debug)]
-pub struct FsMetrics {
-    pub device: String,
-    pub mount_point: String,
-    pub fs_type: String,
-    pub total_bytes: u64,
-    pub used_bytes: u64,
-    pub reserved_bytes: u64,
-    pub inodes_total: u64,
-    pub inodes_free: u64,
-    pub is_read_only: bool,
-}
-
-pub fn collect_fs_metrics() -> Vec<FsMetrics> {
-    let mut metrics = Vec::new();
-    let mounts = fs::read_to_string("/proc/mounts").unwrap_or_default();
-
-    for line in mounts.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 4 { continue; }
-
-        let device = parts[0];
-        let mount_point = parts[1];
-        let fs_type = parts[2];
-
-        if !device.starts_with("/dev/") {
-            continue;
-        }
-
-        let stat = match statvfs(Path::new(mount_point)) {
-            Ok(s) => s,
-            Err(_) => continue, // В рабочем коде здесь стоит писать в log::warn!
-        };
-
-        let block_size = stat.fragment_size() as u64;
-        let total_bytes = stat.blocks() as u64 * block_size;
-        let free_root_bytes = stat.blocks_free() as u64 * block_size;
-        let free_user_bytes = stat.blocks_available() as u64 * block_size;
-
-        let used_bytes = total_bytes - free_root_bytes;
-        let reserved_bytes = free_root_bytes.saturating_sub(free_user_bytes);
-        let is_read_only = stat.flags().contains(FsFlags::ST_RDONLY);
-
-        metrics.push(FsMetrics {
-            device: device.to_string(),
-            mount_point: mount_point.to_string(),
-            fs_type: fs_type.to_string(),
-            total_bytes,
-            used_bytes,
-            reserved_bytes,
-            inodes_total: stat.files() as u64,
-            inodes_free: stat.files_free() as u64,
-            is_read_only,
-        });
-    }
-
-    metrics
-}
-</file>
 
 <file path="otlp-sys-agent/src/collectors/process/mod.rs">
 pub mod collector;
@@ -418,6 +360,936 @@ fn read_proc_uid(path: &Path) -> Option<u32> {
 }
 </file>
 
+<file path="otlp-sys-agent/src/collectors/disk.rs">
+// src/collectors/disk.rs
+
+use crate::collector::Collector;
+use crate::config::DiskConfig;
+use anyhow::Result;
+use async_trait::async_trait;
+use opentelemetry::metrics::Meter;
+use opentelemetry::KeyValue;
+use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+use std::sync::Mutex;
+use tracing::{debug, warn};
+
+/// Информация о физическом диске и его разделах
+#[derive(Debug, Clone)]
+pub struct DiskInfo {
+    /// Имя устройства: sda, nvme0n1, vda
+    pub device: String,
+    /// Модель диска из /sys/block/<dev>/device/model
+    pub model: String,
+    /// Общий размер диска в байтах
+    pub total_bytes: u64,
+    /// SSD (false) или HDD (true)
+    pub rotational: bool,
+    /// Съёмное устройство (USB-флешки и т.п.)
+    pub removable: bool,
+    /// Список разделов: (имя, размер в байтах)
+    pub partitions: Vec<(String, u64)>,
+    /// Неразмеченное пространство (разница между размером диска и суммой разделов)
+    pub unallocated_bytes: u64,
+}
+
+/// I/O статистика диска из /sys/block/<dev>/stat
+#[derive(Debug, Clone, Default, Copy)]
+pub struct DiskIoStats {
+    pub reads_completed: u64,
+    pub read_bytes: u64,
+    pub writes_completed: u64,
+    pub write_bytes: u64,
+    pub io_time_ms: u64,
+    pub io_in_progress: u64,
+}
+
+/// Предыдущее состояние I/O для расчёта дельт
+#[derive(Debug, Clone, Default, Copy)]
+struct DiskIoPrevState {
+    reads_completed: u64,
+    read_sectors: u64,
+    writes_completed: u64,
+    write_sectors: u64,
+    io_time_ms: u64,
+}
+
+// ==============================
+// ЧИСТЫЕ ФУНКЦИИ ПАРСИНГА (для юнит-тестов)
+// ==============================
+
+/// Чистая функция парсинга содержимого /proc/partitions.
+/// Возвращает map {имя_устройства -> размер в байтах}.
+///
+/// Формат /proc/partitions:
+/// ```text
+///  major minor  #blocks  name
+///    8        0  976762584 sda
+///    8        1  974761984 sda1
+/// ```
+/// Размер указан в блоках по 1024 байта.
+pub fn parse_proc_partitions(content: &str) -> HashMap<String, u64> {
+    let mut map = HashMap::new();
+
+    for line in content.lines().skip(2) {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 4 {
+            let blocks_1024: u64 = parts[2].parse().unwrap_or(0);
+            let name = parts[3].to_string();
+            map.insert(name, blocks_1024 * 1024);
+        }
+    }
+
+    map
+}
+
+/// Находит все разделы, принадлежащие конкретному диску.
+/// Для sda: ищет sda1, sda2, ...
+/// Для nvme0n1: ищет nvme0n1p1, nvme0n1p2, ...
+pub fn find_partitions(
+    disk_name: &str,
+    partitions_map: &HashMap<String, u64>,
+) -> Vec<(String, u64)> {
+    let mut result = Vec::new();
+
+    let prefix = if disk_name.starts_with("nvme") || disk_name.starts_with("mmcblk") {
+        format!("{}p", disk_name)
+    } else {
+        disk_name.to_string()
+    };
+
+    for (name, size) in partitions_map {
+        if name.starts_with(&prefix) && name.len() > prefix.len() {
+            let suffix = &name[prefix.len()..];
+            if suffix.chars().all(|c| c.is_ascii_digit()) {
+                result.push((name.clone(), *size));
+            }
+        }
+    }
+
+    result.sort_by(|a, b| a.0.cmp(&b.0));
+    result
+}
+
+/// Расчёт неразмеченного пространства:
+/// unallocated = total_bytes - сумма размеров всех разделов
+pub fn calculate_unallocated(total_bytes: u64, partitions: &[(String, u64)]) -> u64 {
+    let allocated: u64 = partitions.iter().map(|(_, size)| size).sum();
+    total_bytes.saturating_sub(allocated)
+}
+
+/// Фильтр устройств для игнорирования
+pub fn should_skip_device(device_name: &str, config: &DiskConfig) -> bool {
+    if device_name.starts_with("loop")
+        || device_name.starts_with("ram")
+        || device_name.starts_with("zram")
+        || device_name.starts_with("fd")
+    {
+        return true;
+    }
+
+    if config.ignore_device_mapper && device_name.starts_with("dm-") {
+        return true;
+    }
+
+    if config.ignore_devices.contains(&device_name.to_string()) {
+        return true;
+    }
+
+    false
+}
+
+// ==============================
+// ФУНКЦИИ ЧТЕНИЯ СИСТЕМНЫХ ДАННЫХ
+// ==============================
+
+/// Читает /proc/partitions и возвращает map {имя -> размер в байтах}
+fn read_proc_partitions() -> HashMap<String, u64> {
+    match fs::read_to_string("/proc/partitions") {
+        Ok(content) => parse_proc_partitions(&content),
+        Err(_) => HashMap::new(),
+    }
+}
+
+/// Утилита: чтение u64 из sysfs-файла
+fn read_sys_u64(path: &Path) -> Option<u64> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+}
+
+// ==============================
+// СБОР ИНФОРМАЦИИ О ДИСКАХ
+// ==============================
+
+/// Основная функция: собирает информацию о всех физических дисках
+pub fn collect_disk_info(config: &DiskConfig) -> Vec<DiskInfo> {
+    let partitions_map = read_proc_partitions();
+    let mut disks = Vec::new();
+
+    let sys_block_path = Path::new("/sys/block");
+    let entries = match fs::read_dir(sys_block_path) {
+        Ok(e) => e,
+        Err(err) => {
+            warn!("Не удалось прочитать /sys/block: {}", err);
+            return disks;
+        }
+    };
+
+    for entry in entries.flatten() {
+        let device_name = entry.file_name().to_string_lossy().to_string();
+
+        if should_skip_device(&device_name, config) {
+            continue;
+        }
+
+        let dev_path = entry.path();
+
+        // 1. Размер диска в секторах (по 512 байт)
+        let total_bytes = match read_sys_u64(&dev_path.join("size")) {
+            Some(sectors) => sectors * 512,
+            None => continue,
+        };
+
+        if total_bytes == 0 {
+            continue;
+        }
+
+        // 2. Модель диска
+        let model = fs::read_to_string(dev_path.join("device/model"))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| {
+                fs::read_to_string(dev_path.join("model"))
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_else(|_| "unknown".to_string())
+            });
+
+        // 3. SSD или HDD
+        let rotational = read_sys_u64(&dev_path.join("queue/rotational"))
+            .map(|v| v == 1)
+            .unwrap_or(false);
+
+        // 4. Съёмное устройство
+        let removable = read_sys_u64(&dev_path.join("removable"))
+            .map(|v| v == 1)
+            .unwrap_or(false);
+
+        // 5. Найти все разделы этого диска
+        let disk_partitions = find_partitions(&device_name, &partitions_map);
+
+        // 6. Рассчитать неразмеченное пространство
+        let unallocated_bytes = calculate_unallocated(total_bytes, &disk_partitions);
+
+        disks.push(DiskInfo {
+            device: device_name,
+            model,
+            total_bytes,
+            rotational,
+            removable,
+            partitions: disk_partitions,
+            unallocated_bytes,
+        });
+    }
+
+    disks
+}
+
+/// Чтение I/O статистики из /sys/block/<dev>/stat
+/// Формат (11+ полей):
+/// reads_completed reads_merged sectors_read read_time_ms
+/// writes_completed writes_merged sectors_written write_time_ms
+/// io_in_progress io_time_ms weighted_io_time_ms ...
+pub fn collect_disk_io_stats(config: &DiskConfig) -> HashMap<String, DiskIoStats> {
+    let mut stats = HashMap::new();
+    let sys_block_path = Path::new("/sys/block");
+
+    let entries = match fs::read_dir(sys_block_path) {
+        Ok(e) => e,
+        Err(_) => return stats,
+    };
+
+    for entry in entries.flatten() {
+        let device_name = entry.file_name().to_string_lossy().to_string();
+
+        // Фильтруем устройства сразу при сборе
+        if should_skip_device(&device_name, config) {
+            continue;
+        }
+
+        let stat_path = entry.path().join("stat");
+        let content = match fs::read_to_string(&stat_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let fields: Vec<&str> = content.split_whitespace().collect();
+        if fields.len() < 11 {
+            continue;
+        }
+
+        let reads_completed = fields[0].parse::<u64>().unwrap_or(0);
+        let sectors_read = fields[2].parse::<u64>().unwrap_or(0);
+        let writes_completed = fields[4].parse::<u64>().unwrap_or(0);
+        let sectors_written = fields[6].parse::<u64>().unwrap_or(0);
+        let io_in_progress = fields[8].parse::<u64>().unwrap_or(0);
+        let io_time_ms = fields[9].parse::<u64>().unwrap_or(0);
+
+        stats.insert(
+            device_name,
+            DiskIoStats {
+                reads_completed,
+                read_bytes: sectors_read * 512,
+                writes_completed,
+                write_bytes: sectors_written * 512,
+                io_time_ms,
+                io_in_progress,
+            },
+        );
+    }
+
+    stats
+}
+
+// ==============================
+// COLLECTOR IMPLEMENTATION
+// ==============================
+
+pub struct DiskCollector {
+    hostname: String,
+    config: DiskConfig,
+    prev_io: Mutex<HashMap<String, DiskIoPrevState>>,
+}
+
+impl DiskCollector {
+    pub fn new(config: DiskConfig, hostname: String) -> Self {
+        Self {
+            config,
+            hostname,
+            prev_io: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl Collector for DiskCollector {
+    fn name(&self) -> &'static str {
+        "disk"
+    }
+
+    async fn collect(&self, meter: &Meter) -> Result<()> {
+        // ── 1. Информация о дисках ──
+        let disks = collect_disk_info(&self.config);
+
+        let total_gauge = meter
+            .u64_gauge("system.disk.total_bytes")
+            .with_description("Total size of physical disk in bytes")
+            .with_unit("By")
+            .build();
+
+        let unallocated_gauge = meter
+            .u64_gauge("system.disk.unallocated_bytes")
+            .with_description("Unallocated (free) space on physical disk")
+            .with_unit("By")
+            .build();
+
+        let partition_gauge = meter
+            .u64_gauge("system.disk.partition_size_bytes")
+            .with_description("Size of disk partition in bytes")
+            .with_unit("By")
+            .build();
+
+        for disk in &disks {
+            let base_attrs = [
+                KeyValue::new("host_name", self.hostname.clone()),
+                KeyValue::new("device", disk.device.clone()),
+                KeyValue::new("model", disk.model.clone()),
+                KeyValue::new("rotational", disk.rotational),
+                KeyValue::new("removable", disk.removable),
+            ];
+
+            total_gauge.record(disk.total_bytes, &base_attrs);
+            unallocated_gauge.record(disk.unallocated_bytes, &base_attrs);
+
+            for (part_name, part_size) in &disk.partitions {
+                let part_attrs = [
+                    KeyValue::new("host_name", self.hostname.clone()),
+                    KeyValue::new("device", disk.device.clone()),
+                    KeyValue::new("partition", part_name.clone()),
+                ];
+                partition_gauge.record(*part_size, &part_attrs);
+            }
+
+            debug!(
+                device = %disk.device,
+                model = %disk.model,
+                total_gb = disk.total_bytes / 1024 / 1024 / 1024,
+                unallocated_gb = disk.unallocated_bytes / 1024 / 1024 / 1024,
+                partitions = disk.partitions.len(),
+                "Метрики диска отправлены"
+            );
+        }
+
+        // ── 2. I/O статистика дисков ──
+        if !self.config.collect_io {
+            return Ok(());
+        }
+
+        let io_stats = collect_disk_io_stats(&self.config);
+
+        let read_counter = meter
+            .u64_counter("system.disk.io.read_bytes")
+            .with_description("Bytes read from disk")
+            .with_unit("By")
+            .build();
+
+        let write_counter = meter
+            .u64_counter("system.disk.io.write_bytes")
+            .with_description("Bytes written to disk")
+            .with_unit("By")
+            .build();
+
+        let reads_counter = meter
+            .u64_counter("system.disk.io.reads_completed")
+            .with_description("Number of completed read operations")
+            .build();
+
+        let writes_counter = meter
+            .u64_counter("system.disk.io.writes_completed")
+            .with_description("Number of completed write operations")
+            .build();
+
+        let io_time_counter = meter
+            .u64_counter("system.disk.io.io_time_ms")
+            .with_description("Time spent doing I/Os in milliseconds")
+            .with_unit("ms")
+            .build();
+
+        let io_in_progress_gauge = meter
+            .u64_gauge("system.disk.io.in_progress")
+            .with_description("Number of I/Os currently in progress")
+            .build();
+
+        let mut prev_map = self.prev_io.lock().unwrap();
+        let mut next_map = HashMap::new();
+
+        for (device, io) in &io_stats {
+            let attrs = [
+                KeyValue::new("host_name", self.hostname.clone()),
+                KeyValue::new("device", device.clone()),
+            ];
+
+            let cur_read_sectors = io.read_bytes / 512;
+            let cur_write_sectors = io.write_bytes / 512;
+
+            let has_prev = prev_map.contains_key(device);
+
+            if has_prev {
+                let prev = prev_map[device];
+
+                let delta_read_bytes =
+                    cur_read_sectors.saturating_sub(prev.read_sectors) * 512;
+                let delta_write_bytes =
+                    cur_write_sectors.saturating_sub(prev.write_sectors) * 512;
+                let delta_reads =
+                    io.reads_completed.saturating_sub(prev.reads_completed);
+                let delta_writes =
+                    io.writes_completed.saturating_sub(prev.writes_completed);
+                let delta_io_time =
+                    io.io_time_ms.saturating_sub(prev.io_time_ms);
+
+                read_counter.add(delta_read_bytes, &attrs);
+                write_counter.add(delta_write_bytes, &attrs);
+                reads_counter.add(delta_reads, &attrs);
+                writes_counter.add(delta_writes, &attrs);
+                io_time_counter.add(delta_io_time, &attrs);
+            }
+
+            io_in_progress_gauge.record(io.io_in_progress, &attrs);
+
+            next_map.insert(
+                device.clone(),
+                DiskIoPrevState {
+                    reads_completed: io.reads_completed,
+                    read_sectors: cur_read_sectors,
+                    writes_completed: io.writes_completed,
+                    write_sectors: cur_write_sectors,
+                    io_time_ms: io.io_time_ms,
+                },
+            );
+        }
+
+        *prev_map = next_map;
+
+        Ok(())
+    }
+}
+</file>
+
+<file path="otlp-sys-agent/src/collectors/filesystem.rs">
+// src/collectors/filesystem.rs
+
+use crate::collector::Collector;
+use crate::config::FilesystemConfig;
+use anyhow::Result;
+use async_trait::async_trait;
+use nix::sys::statvfs::{statvfs, FsFlags};
+use opentelemetry::metrics::Meter;
+use opentelemetry::KeyValue;
+use std::fs;
+use std::path::Path;
+use tracing::{debug, warn};
+
+#[derive(Debug)]
+pub struct FsMetrics {
+    pub device: String,
+    pub mount_point: String,
+    pub fs_type: String,
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub free_bytes: u64,
+    pub reserved_bytes: u64,
+    pub inodes_total: u64,
+    pub inodes_free: u64,
+    pub is_read_only: bool,
+}
+
+/// Запись из /proc/mounts
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountEntry {
+    pub device: String,
+    pub mount_point: String,
+    pub fs_type: String,
+}
+
+/// Чистая функция парсинга содержимого /proc/mounts.
+/// Фильтрует ТОЛЬКО по префиксу /dev/ (базовая фильтрация).
+/// НЕ применяет фильтры из конфига — это задача collect_fs_metrics.
+pub fn parse_proc_mounts(content: &str) -> Vec<MountEntry> {
+    let mut entries = Vec::new();
+
+    for line in content.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 4 {
+            continue;
+        }
+
+        let device = parts[0];
+        let mount_point = parts[1];
+        let fs_type = parts[2];
+
+        // Только реальные блочные устройства
+        if !device.starts_with("/dev/") {
+            continue;
+        }
+
+        entries.push(MountEntry {
+            device: device.to_string(),
+            mount_point: mount_point.to_string(),
+            fs_type: fs_type.to_string(),
+        });
+    }
+
+    entries
+}
+
+/// Полный сбор метрик: парсинг + фильтрация по config + statvfs
+pub fn collect_fs_metrics(config: &FilesystemConfig) -> Vec<FsMetrics> {
+    let mut metrics = Vec::new();
+    let mounts = fs::read_to_string("/proc/mounts").unwrap_or_default();
+    let entries = parse_proc_mounts(&mounts);
+
+    for entry in entries {
+        // Фильтр: игнорировать определённые типы ФС (из конфига)
+        if config.ignore_fs_types.iter().any(|t| t == &entry.fs_type) {
+            continue;
+        }
+
+        // Фильтр: игнорировать определённые точки монтирования (из конфига)
+        if config
+            .ignore_mount_points
+            .iter()
+            .any(|mp| entry.mount_point.starts_with(mp.as_str()))
+        {
+            continue;
+        }
+
+        let stat = match statvfs(Path::new(&entry.mount_point)) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    mountpoint = %entry.mount_point,
+                    error = %e,
+                    "Ошибка statvfs"
+                );
+                continue;
+            }
+        };
+
+        let block_size = stat.fragment_size() as u64;
+        let total_bytes = stat.blocks() as u64 * block_size;
+        let free_root_bytes = stat.blocks_free() as u64 * block_size;
+        let free_user_bytes = stat.blocks_available() as u64 * block_size;
+        let used_bytes = total_bytes.saturating_sub(free_root_bytes);
+        let reserved_bytes = free_root_bytes.saturating_sub(free_user_bytes);
+        let is_read_only = stat.flags().contains(FsFlags::ST_RDONLY);
+
+        metrics.push(FsMetrics {
+            device: entry.device,
+            mount_point: entry.mount_point,
+            fs_type: entry.fs_type,
+            total_bytes,
+            used_bytes,
+            free_bytes: free_user_bytes,
+            reserved_bytes,
+            inodes_total: stat.files() as u64,
+            inodes_free: stat.files_free() as u64,
+            is_read_only,
+        });
+    }
+
+    metrics
+}
+
+// ========================
+// COLLECTOR IMPLEMENTATION
+// ========================
+
+pub struct FilesystemCollector {
+    hostname: String,
+    config: FilesystemConfig,
+}
+
+impl FilesystemCollector {
+    pub fn new(config: FilesystemConfig, hostname: String) -> Self {
+        Self { config, hostname }
+    }
+}
+
+#[async_trait]
+impl Collector for FilesystemCollector {
+    fn name(&self) -> &'static str {
+        "filesystem"
+    }
+
+    async fn collect(&self, meter: &Meter) -> Result<()> {
+        let fs_metrics = collect_fs_metrics(&self.config);
+
+        let total_gauge = meter
+            .u64_gauge("system.filesystem.total_bytes")
+            .with_description("Total filesystem size in bytes")
+            .with_unit("By")
+            .build();
+
+        let used_gauge = meter
+            .u64_gauge("system.filesystem.used_bytes")
+            .with_description("Used filesystem space in bytes")
+            .with_unit("By")
+            .build();
+
+        let free_gauge = meter
+            .u64_gauge("system.filesystem.free_bytes")
+            .with_description("Free filesystem space available to non-root users")
+            .with_unit("By")
+            .build();
+
+        let reserved_gauge = meter
+            .u64_gauge("system.filesystem.reserved_bytes")
+            .with_description("Reserved filesystem space (root-only blocks)")
+            .with_unit("By")
+            .build();
+
+        let inodes_total_gauge = meter
+            .u64_gauge("system.filesystem.inodes_total")
+            .with_description("Total number of filesystem inodes")
+            .build();
+
+        let inodes_free_gauge = meter
+            .u64_gauge("system.filesystem.inodes_free")
+            .with_description("Number of free filesystem inodes")
+            .build();
+
+        for fs in &fs_metrics {
+            let attrs = [
+                KeyValue::new("host_name", self.hostname.clone()),
+                KeyValue::new("device", fs.device.clone()),
+                KeyValue::new("mountpoint", fs.mount_point.clone()),
+                KeyValue::new("fstype", fs.fs_type.clone()),
+            ];
+
+            total_gauge.record(fs.total_bytes, &attrs);
+            used_gauge.record(fs.used_bytes, &attrs);
+            free_gauge.record(fs.free_bytes, &attrs);
+            reserved_gauge.record(fs.reserved_bytes, &attrs);
+            inodes_total_gauge.record(fs.inodes_total, &attrs);
+            inodes_free_gauge.record(fs.inodes_free, &attrs);
+
+            debug!(
+                device = %fs.device,
+                mountpoint = %fs.mount_point,
+                total = fs.total_bytes,
+                used = fs.used_bytes,
+                free = fs.free_bytes,
+                reserved = fs.reserved_bytes,
+                "Метрики файловой системы отправлены"
+            );
+        }
+
+        Ok(())
+    }
+}
+</file>
+
+<file path="otlp-sys-agent/src/collectors/system.rs">
+// src/collectors/system.rs
+
+use crate::collector::Collector;
+use anyhow::Result;
+use async_trait::async_trait;
+use opentelemetry::metrics::Meter;
+use opentelemetry::KeyValue;
+use std::collections::HashMap;
+use std::fs;
+use std::sync::Mutex;
+// ❌ УБРАНО: use tracing::warn;   (не используется)
+
+/// Информация о CPU из /proc/cpuinfo
+#[derive(Debug, Clone)]
+pub struct CpuInfo {
+    pub model: String,
+    pub cores: u64,
+    pub threads: u64,
+}
+
+/// Состояние CPU из /proc/stat (для расчёта загрузки)
+/// ✅ СДЕЛАНО pub + поля pub для доступа из тестов
+#[derive(Debug, Clone, Default, Copy)]
+pub struct CpuStatState {
+    pub user: u64,
+    pub nice: u64,
+    pub system: u64,
+    pub idle: u64,
+    pub iowait: u64,
+    pub irq: u64,
+    pub softirq: u64,
+    pub steal: u64,
+}
+
+impl CpuStatState {
+    /// Суммарное время всех состояний CPU
+    pub fn total(&self) -> u64 {
+        self.user + self.nice + self.system + self.idle
+            + self.iowait + self.irq + self.softirq + self.steal
+    }
+
+    /// Время, когда CPU был занят (всё кроме idle и iowait)
+    pub fn busy(&self) -> u64 {
+        self.user + self.nice + self.system + self.irq + self.softirq + self.steal
+    }
+}
+
+/// Информация о памяти из /proc/meminfo
+#[derive(Debug, Clone)]
+pub struct MemoryInfo {
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+    pub used_bytes: u64,
+    pub free_bytes: u64,
+    pub buffers_bytes: u64,
+    pub cached_bytes: u64,
+}
+
+// ==============================
+// ЧИСТЫЕ ФУНКЦИИ ПАРСИНГА
+// ==============================
+
+pub fn parse_cpuinfo(content: &str) -> CpuInfo {
+    let mut model = String::from("unknown");
+    let mut physical_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut threads: u64 = 0;
+
+    for line in content.lines() {
+        let parts: Vec<&str> = line.splitn(2, ':').collect();
+        if parts.len() != 2 {
+            continue;
+        }
+        let key = parts[0].trim();
+        let value = parts[1].trim();
+
+        match key {
+            "model name" => {
+                if model == "unknown" {
+                    model = value.to_string();
+                }
+            }
+            "physical id" => {
+                physical_ids.insert(value.to_string());
+            }
+            "processor" => {
+                threads += 1;
+            }
+            _ => {}
+        }
+    }
+
+    let cores = if physical_ids.is_empty() { threads } else { threads };
+
+    CpuInfo { model, cores, threads }
+}
+
+pub fn parse_proc_stat(content: &str) -> CpuStatState {
+    for line in content.lines() {
+        if line.starts_with("cpu ") {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() >= 8 {
+                return CpuStatState {
+                    user: fields[1].parse().unwrap_or(0),
+                    nice: fields[2].parse().unwrap_or(0),
+                    system: fields[3].parse().unwrap_or(0),
+                    idle: fields[4].parse().unwrap_or(0),
+                    iowait: fields[5].parse().unwrap_or(0),
+                    irq: fields[6].parse().unwrap_or(0),
+                    softirq: fields[7].parse().unwrap_or(0),
+                    steal: fields.get(8).and_then(|v| v.parse().ok()).unwrap_or(0),
+                };
+            }
+        }
+    }
+    CpuStatState::default()
+}
+
+pub fn parse_meminfo(content: &str) -> MemoryInfo {
+    let mut map: HashMap<&str, u64> = HashMap::new();
+
+    for line in content.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 2 {
+            let key = parts[0].trim_end_matches(':');
+            let value_kb: u64 = parts[1].parse().unwrap_or(0);
+            map.insert(key, value_kb * 1024);
+        }
+    }
+
+    let total = map.get("MemTotal").copied().unwrap_or(0);
+    let available = map.get("MemAvailable").copied().unwrap_or(0);
+    let free = map.get("MemFree").copied().unwrap_or(0);
+    let buffers = map.get("Buffers").copied().unwrap_or(0);
+    let cached = map.get("Cached").copied().unwrap_or(0);
+    let used = total.saturating_sub(available);
+
+    MemoryInfo {
+        total_bytes: total,
+        available_bytes: available,
+        used_bytes: used,
+        free_bytes: free,
+        buffers_bytes: buffers,
+        cached_bytes: cached,
+    }
+}
+
+pub fn calculate_cpu_usage(prev: &CpuStatState, cur: &CpuStatState) -> f64 {
+    let total_delta = cur.total().saturating_sub(prev.total());
+    let busy_delta = cur.busy().saturating_sub(prev.busy());
+    if total_delta == 0 {
+        return 0.0;
+    }
+    (busy_delta as f64 / total_delta as f64) * 100.0
+}
+
+// ==============================
+// COLLECTOR IMPLEMENTATION
+// (остальная часть без изменений)
+// ==============================
+
+pub struct SystemCollector {
+    hostname: String,
+    prev_cpu_stat: Mutex<CpuStatState>,
+}
+
+impl SystemCollector {
+    pub fn new(hostname: String) -> Self {
+        Self {
+            hostname,
+            prev_cpu_stat: Mutex::new(CpuStatState::default()),
+        }
+    }
+}
+
+#[async_trait]
+impl Collector for SystemCollector {
+    fn name(&self) -> &'static str {
+        "system"
+    }
+
+    async fn collect(&self, meter: &Meter) -> Result<()> {
+        let base_attrs = [KeyValue::new("host_name", self.hostname.clone())];
+
+        // CPU Info
+        let cpuinfo_content = fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+        let cpu_info = parse_cpuinfo(&cpuinfo_content);
+
+        let cpu_info_gauge = meter
+            .f64_gauge("system.cpu.info")
+            .with_description("CPU metadata (always 1)")
+            .build();
+
+        let cpu_info_attrs = [
+            KeyValue::new("host_name", self.hostname.clone()),
+            KeyValue::new("cpu_model", cpu_info.model.clone()),
+            KeyValue::new("cpu_threads", cpu_info.threads.to_string()),
+        ];
+        cpu_info_gauge.record(1.0, &cpu_info_attrs);
+
+        // CPU Usage
+        let stat_content = fs::read_to_string("/proc/stat").unwrap_or_default();
+        let cur_stat = parse_proc_stat(&stat_content);
+
+        let cpu_usage_gauge = meter
+            .f64_gauge("system.cpu.usage")
+            .with_description("CPU usage percentage (0-100)")
+            .with_unit("%")
+            .build();
+
+        let mut prev_stat = self.prev_cpu_stat.lock().unwrap();
+        let usage = calculate_cpu_usage(&prev_stat, &cur_stat);
+        cpu_usage_gauge.record(usage, &base_attrs);
+        *prev_stat = cur_stat;
+
+        // Memory
+        let meminfo_content = fs::read_to_string("/proc/meminfo").unwrap_or_default();
+        let mem = parse_meminfo(&meminfo_content);
+
+        let mem_total_gauge = meter
+            .u64_gauge("system.memory.total_bytes")
+            .with_description("Total system memory in bytes")
+            .with_unit("By")
+            .build();
+        let mem_used_gauge = meter
+            .u64_gauge("system.memory.used_bytes")
+            .with_description("Used system memory in bytes")
+            .with_unit("By")
+            .build();
+        let mem_available_gauge = meter
+            .u64_gauge("system.memory.available_bytes")
+            .with_description("Available system memory in bytes")
+            .with_unit("By")
+            .build();
+        let mem_free_gauge = meter
+            .u64_gauge("system.memory.free_bytes")
+            .with_description("Free system memory in bytes")
+            .with_unit("By")
+            .build();
+
+        mem_total_gauge.record(mem.total_bytes, &base_attrs);
+        mem_used_gauge.record(mem.used_bytes, &base_attrs);
+        mem_available_gauge.record(mem.available_bytes, &base_attrs);
+        mem_free_gauge.record(mem.free_bytes, &base_attrs);
+
+        Ok(())
+    }
+}
+</file>
+
 <file path="otlp-sys-agent/src/collectors/temperature.rs">
 use crate::collector::Collector;
 use anyhow::Result;
@@ -608,40 +1480,131 @@ pub mod config;
 pub mod telemetry;
 </file>
 
-<file path="otlp-sys-agent/src/telemetry.rs">
-use crate::config::AppConfig;
-use anyhow::Result;
-use opentelemetry::KeyValue;
-use opentelemetry_otlp::{MetricExporter, WithExportConfig};
-use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
-use opentelemetry_sdk::Resource;
-use std::time::Duration;
+<file path="otlp-sys-agent/tests/filesystem_test.rs">
+// tests/filesystem_test.rs
 
-pub fn init_meter_provider(config: &AppConfig) -> Result<SdkMeterProvider> {
-    let hostname = config.get_hostname();
+use otlp_sys_agent::collectors::filesystem::{parse_proc_mounts, collect_fs_metrics};
+use otlp_sys_agent::config::FilesystemConfig;
 
-    // Переключаем экспортер на OTLP over HTTP
-    let exporter = MetricExporter::builder()
-        .with_http()
-        .with_endpoint(&config.otlp.endpoint)
-        .with_timeout(Duration::from_secs(config.otlp.timeout_secs))
-        .build()?;
+/// Реалистичный вывод /proc/mounts
+fn mock_proc_mounts() -> &'static str {
+    r#"sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0
+proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
+udev /dev devtmpfs rw,nosuid,noexec,relatime,size=8045012k,nr_inodes=2011253,mode=755 0 0
+/dev/sda1 / ext4 rw,relatime,errors=remap-ro 0 0
+/dev/sda2 /home ext4 rw,relatime 0 0
+/dev/nvme0n1p1 /data xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota 0 0
+tmpfs /run tmpfs rw,nosuid,nodev,noexec,relatime,size=1611076k,mode=755 0 0
+/dev/sdb1 /mnt/backup ext4 ro,relatime 0 0
+overlay /var/lib/docker/overlay2/abc/merged overlay rw,relatime,lowerdir=...,upperdir=...,workdir=... 0 0
+/dev/mapper/vg-lv /var/lib/lvm ext4 rw,relatime 0 0
+"#
+}
 
-    let reader = PeriodicReader::builder(exporter, opentelemetry_sdk::runtime::Tokio)
-        .with_interval(Duration::from_secs(config.agent.interval_secs))
-        .build();
+#[test]
+fn test_parse_proc_mounts_filters_real_devices() {
+    let entries = parse_proc_mounts(mock_proc_mounts());
 
-    let resource = Resource::new(vec![
-        KeyValue::new("service.name", "otlp-sys-agent"),
-        KeyValue::new("host.name", hostname),
-    ]);
+    // Должны остаться только /dev/* устройства:
+    // sda1, sda2, nvme0n1p1, sdb1, mapper/vg-lv
+    // НЕ должны: sysfs, proc, udev, tmpfs, overlay
+    assert_eq!(entries.len(), 5);
+}
 
-    let provider = SdkMeterProvider::builder()
-        .with_resource(resource)
-        .with_reader(reader)
-        .build();
+#[test]
+fn test_parse_proc_mounts_correct_fields() {
+    let entries = parse_proc_mounts(mock_proc_mounts());
 
-    Ok(provider)
+    // Первый реальный девайс: /dev/sda1
+    let root = &entries[0];
+    assert_eq!(root.device, "/dev/sda1");
+    assert_eq!(root.mount_point, "/");
+    assert_eq!(root.fs_type, "ext4");
+
+    // NVMe устройство
+    let nvme = &entries[2];
+    assert_eq!(nvme.device, "/dev/nvme0n1p1");
+    assert_eq!(nvme.mount_point, "/data");
+    assert_eq!(nvme.fs_type, "xfs");
+}
+
+#[test]
+fn test_parse_proc_mounts_skips_virtual_fs() {
+    let entries = parse_proc_mounts(mock_proc_mounts());
+
+    for entry in &entries {
+        assert!(
+            entry.device.starts_with("/dev/"),
+            "Обнаружено не-блочное устройство: {}",
+            entry.device
+        );
+    }
+}
+
+#[test]
+fn test_parse_proc_mounts_empty_input() {
+    let entries = parse_proc_mounts("");
+    assert!(entries.is_empty());
+}
+
+#[test]
+fn test_parse_proc_mounts_malformed_lines() {
+    let content = "incomplete\n/dev/sda1 /\n/dev/sda2 /home ext4 rw 0 0\n";
+    let entries = parse_proc_mounts(content);
+    // Только одна строка имеет >= 4 полей и /dev/
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].device, "/dev/sda2");
+}
+
+#[test]
+fn test_collect_fs_metrics_integration() {
+    // Интеграционный тест: работает только на Linux с /proc/mounts
+    // Используем default config (без игнорирования типов ФС)
+    let config = FilesystemConfig {
+        enabled: true,
+        ignore_mount_points: vec![],
+        ignore_fs_types: vec![],
+    };
+
+    let metrics = collect_fs_metrics(&config);
+
+    // На любой Linux-системе должен быть хотя бы корень (/)
+    assert!(
+        !metrics.is_empty(),
+        "Ожидается хотя бы одна файловая система"
+    );
+
+    // Проверяем корневую ФС
+    let root_fs = metrics.iter().find(|m| m.mount_point == "/");
+    if let Some(root) = root_fs {
+        assert!(root.total_bytes > 0, "Общий объём корня должен быть > 0");
+        assert!(root.used_bytes <= root.total_bytes, "Занято <= Общего");
+        assert!(root.inodes_total > 0, "Inodes total > 0");
+    }
+}
+
+#[test]
+fn test_collect_fs_metrics_with_config_filters() {
+    // Проверяем, что config-фильтры работают
+    let config = FilesystemConfig {
+        enabled: true,
+        ignore_mount_points: vec!["/mnt".to_string()],
+        ignore_fs_types: vec!["xfs".to_string()],
+    };
+
+    let metrics = collect_fs_metrics(&config);
+
+    // Убеждаемся, что отфильтрованные ФС не попали
+    for m in &metrics {
+        assert!(
+            !m.mount_point.starts_with("/mnt"),
+            "Точка /mnt должна быть отфильтрована"
+        );
+        assert!(
+            m.fs_type != "xfs",
+            "ФС типа xfs должна быть отфильтрована"
+        );
+    }
 }
 </file>
 
@@ -808,6 +1771,72 @@ fn test_read_process_io_parsing() {
 }
 </file>
 
+<file path="otlp-sys-agent/tests/system_test.rs">
+use otlp_sys_agent::collectors::system::{
+    calculate_cpu_usage, parse_cpuinfo, parse_meminfo, parse_proc_stat,
+};
+
+#[test]
+fn test_parse_cpuinfo() {
+    let content = r#"processor	: 0
+vendor_id	: GenuineIntel
+model name	: Intel(R) Core(TM) i7-9700 CPU @ 3.00GHz
+physical id	: 0
+
+processor	: 1
+vendor_id	: GenuineIntel
+model name	: Intel(R) Core(TM) i7-9700 CPU @ 3.00GHz
+physical id	: 0
+"#;
+    let info = parse_cpuinfo(content);
+    assert_eq!(info.model, "Intel(R) Core(TM) i7-9700 CPU @ 3.00GHz");
+    assert_eq!(info.threads, 2);
+}
+
+#[test]
+fn test_parse_proc_stat() {
+    let content = "cpu  1000 200 300 5000 100 50 25 10 0 0\ncpu0 500 100 150 2500 50 25 12 5 0 0\n";
+    let state = parse_proc_stat(content);
+    assert_eq!(state.user, 1000);
+    assert_eq!(state.nice, 200);
+    assert_eq!(state.system, 300);
+    assert_eq!(state.idle, 5000);
+    assert_eq!(state.iowait, 100);
+}
+
+#[test]
+fn test_parse_meminfo() {
+    let content = "MemTotal:       16384000 kB\nMemFree:         4096000 kB\nMemAvailable:    8192000 kB\nBuffers:          512000 kB\nCached:          2048000 kB\n";
+    let mem = parse_meminfo(content);
+    assert_eq!(mem.total_bytes, 16384000 * 1024);
+    assert_eq!(mem.available_bytes, 8192000 * 1024);
+    assert_eq!(mem.free_bytes, 4096000 * 1024);
+    assert_eq!(mem.used_bytes, (16384000 - 8192000) * 1024);
+}
+
+#[test]
+fn test_calculate_cpu_usage() {
+    let prev = otlp_sys_agent::collectors::system::parse_proc_stat(
+        "cpu  1000 0 500 8000 500 0 0 0 0 0\n"
+    );
+    let cur = otlp_sys_agent::collectors::system::parse_proc_stat(
+        "cpu  2000 0 1000 9000 500 0 0 0 0 0\n"
+    );
+    // busy_delta = (2000-1000) + (1000-500) = 1500
+    // total_delta = (2000+1000+9000+500) - (1000+500+8000+500) = 2500
+    // usage = 1500/2500 * 100 = 60%
+    let usage = calculate_cpu_usage(&prev, &cur);
+    assert!((usage - 60.0).abs() < 0.01, "Expected 60%, got {}", usage);
+}
+
+#[test]
+fn test_calculate_cpu_usage_zero_delta() {
+    let state = parse_proc_stat("cpu  1000 0 500 8000 500 0 0 0 0 0\n");
+    let usage = calculate_cpu_usage(&state, &state);
+    assert_eq!(usage, 0.0);
+}
+</file>
+
 <file path="otlp-sys-agent/.env.example">
 # Переопределение параметров агента (имеет высший приоритет над config.yaml)
 OTLP_AGENT__AGENT__LOG_LEVEL=<type>
@@ -821,34 +1850,6 @@ OTLP_AGENT__OTLP__ENDPOINT=<url>
 **/target/
 Cargo.lock
 .env
-</file>
-
-<file path=".gitignore">
-# Rust / Cargo build artifacts
-/target/
-**/target/
-Cargo.lock
-
-# Taskfile output & Release Archives
-/dist/
-*.tar.gz
-*.zip
-
-# Local environment variables and secrets
-.env
-!.env.example
-
-# IDEs & Editors
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-.zed/
-
-# System files
-.DS_Store
-otlp-sys-agent/.tree.txt
 </file>
 
 <file path="GrafanaCPUTempDashBoardExample.json">
@@ -2190,11 +3191,1077 @@ impl Collector for IptablesCollector {
 }
 </file>
 
-<file path="otlp-sys-agent/src/collectors/mod.rs">
-pub mod iptables;
-pub mod temperature;
-pub mod process;
-pub mod filesystem;
+<file path="otlp-sys-agent/src/collectors/network.rs">
+// src/collectors/network.rs
+
+use crate::collector::Collector;
+use crate::config::NetworkConfig;
+use anyhow::Result;
+use async_trait::async_trait;
+use nix::ifaddrs::getifaddrs;
+use opentelemetry::metrics::Meter;
+use opentelemetry::KeyValue;
+use std::collections::HashMap;
+use std::fs;
+use std::net::Ipv6Addr;
+use std::path::Path;
+use tracing::{debug, warn};
+
+/// Полная информация о сетевом интерфейсе
+#[derive(Debug, Clone)]
+pub struct NetworkInterfaceInfo {
+    pub name: String,
+    pub mac: String,
+    pub speed_mbps: Option<u64>,
+    pub duplex: Option<String>,
+    pub operstate: String,
+    pub flags: u32,          // <-- ДОБАВЛЕНО
+    pub ipv4: Vec<String>,
+    pub ipv6: Vec<String>,
+}
+
+/// I/O статистика интерфейса
+#[derive(Debug, Clone, Default, Copy)]
+pub struct NetworkIoStats {
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub rx_packets: u64,
+    pub tx_packets: u64,
+    pub rx_errors: u64,
+    pub tx_errors: u64,
+    pub rx_dropped: u64,
+    pub tx_dropped: u64,
+}
+
+// ==============================
+// ЧИСТЫЕ ФУНКЦИИ ПАРСИНГА (для юнит-тестов)
+// ==============================
+
+/// Парсит MAC-адрес, нормализуя регистр и убирая trailing newline
+pub fn parse_mac(raw: &str) -> String {
+    raw.trim().to_lowercase()
+}
+
+/// Парсит скорость из sysfs. Возвращает None, если:
+/// - файл недоступен (интерфейс down, виртуальный)
+/// - значение невалидно
+/// - значение == -1 (нет линка)
+/// - значение == 4294961 (магическое значение для virtio без линка)
+pub fn parse_speed_mbps(raw: &str) -> Option<u64> {
+    let s = raw.trim();
+    let v = s.parse::<i64>().ok()?;
+    if v <= 0 || v == 4294961 {
+        return None;
+    }
+    Some(v as u64)
+}
+
+/// Парсит duplex из sysfs
+pub fn parse_duplex(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if s.is_empty() || s == "unknown" {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
+/// Парсит operstate из sysfs
+pub fn parse_operstate(raw: &str) -> String {
+    let s = raw.trim();
+    if s.is_empty() {
+        "unknown".to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Парсит hex-флаги интерфейса из sysfs.
+/// Пример: "0x11091" -> 0x11091
+pub fn parse_interface_flags(raw: &str) -> u32 {
+    let s = raw.trim();
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    u32::from_str_radix(s, 16).unwrap_or(0)
+}
+
+/// Определяет, UP ли интерфейс, по operstate и флагам.
+///
+/// Логика:
+/// - operstate == "up" → UP
+/// - operstate == "down" → DOWN
+/// - operstate == "unknown" → проверяем флаг IFF_UP (0x1)
+///   (PPP, bridge и другие интерфейсы без carrier detection)
+pub fn is_interface_up(operstate: &str, flags: u32) -> bool {
+    match operstate {
+        "up" => true,
+        "down" => false,
+        _ => {
+            // IFF_UP = 0x1
+            (flags & 0x1) != 0
+        }
+    }
+}
+
+/// Фильтр интерфейсов
+pub fn should_skip_interface(name: &str, config: &NetworkConfig) -> bool {
+    // Точные совпадения
+    if config.ignore_exact.contains(&name.to_string()) {
+        return true;
+    }
+    // По префиксам
+    for prefix in &config.ignore_interfaces {
+        if name.starts_with(prefix) || name == prefix {
+            return true;
+        }
+    }
+    false
+}
+
+/// Парсит sysfs-статистику из содержимого директории statistics/
+pub fn parse_statistics(stats: &HashMap<String, String>) -> NetworkIoStats {
+    let get = |key: &str| -> u64 {
+        stats.get(key).and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+    };
+
+    NetworkIoStats {
+        rx_bytes: get("rx_bytes"),
+        tx_bytes: get("tx_bytes"),
+        rx_packets: get("rx_packets"),
+        tx_packets: get("tx_packets"),
+        rx_errors: get("rx_errors"),
+        tx_errors: get("tx_errors"),
+        rx_dropped: get("rx_dropped"),
+        tx_dropped: get("tx_dropped"),
+    }
+}
+
+// ==============================
+// ФУНКЦИИ ЧТЕНИЯ СИСТЕМНЫХ ДАННЫХ
+// ==============================
+
+/// Утилита: чтение строки из sysfs-файла
+fn read_sys_str(path: &Path) -> Option<String> {
+    fs::read_to_string(path).ok().map(|s| s.trim().to_string())
+}
+
+/// Собирает map {имя_интерфейса -> (Vec<IPv4>, Vec<IPv6>)}
+fn collect_ip_addresses() -> HashMap<String, (Vec<String>, Vec<String>)> {
+    let mut map: HashMap<String, (Vec<String>, Vec<String>)> = HashMap::new();
+
+    let addrs = match getifaddrs() {
+        Ok(a) => a,
+        Err(e) => {
+            warn!("Не удалось получить список IP-адресов: {}", e);
+            return map;
+        }
+    };
+
+    for ifaddr in addrs {
+        let name = ifaddr.interface_name;
+        let entry = map.entry(name).or_insert_with(|| (Vec::new(), Vec::new()));
+
+        if let Some(addr) = ifaddr.address {
+            // addr имеет тип nix::sys::socket::SockaddrStorage
+
+            // Пытаемся получить IPv4
+            if let Some(ipv4) = addr.as_sockaddr_in() {
+                let ip = ipv4.ip(); // возвращает std::net::Ipv4Addr
+                // Пропускаем link-local (169.254.0.0/16)
+                if !ip.is_link_local() {
+                    entry.0.push(ip.to_string());
+                }
+            }
+            // Пытаемся получить IPv6
+            else if let Some(ipv6) = addr.as_sockaddr_in6() {
+                let ip = ipv6.ip(); // возвращает std::net::Ipv6Addr
+                // Пропускаем link-local (fe80::)
+                if !is_ipv6_link_local(&ip) {
+                    entry.1.push(ip.to_string());
+                }
+            }
+        }
+    }
+
+    map
+}
+
+fn is_ipv6_link_local(ip: &Ipv6Addr) -> bool {
+    let seg = ip.segments();
+    (seg[0] & 0xffc0) == 0xfe80
+}
+
+/// Читает sysfs-статистику из директории /sys/class/net/<iface>/statistics/
+fn read_interface_statistics(iface_path: &Path) -> NetworkIoStats {
+    let stats_dir = iface_path.join("statistics");
+    let mut map = HashMap::new();
+
+    let entries = match fs::read_dir(&stats_dir) {
+        Ok(e) => e,
+        Err(_) => return NetworkIoStats::default(),
+    };
+
+    for entry in entries.flatten() {
+        if let Some(name) = entry.file_name().to_str() {
+            if let Ok(content) = fs::read_to_string(entry.path()) {
+                map.insert(name.to_string(), content);
+            }
+        }
+    }
+
+    parse_statistics(&map)
+}
+
+/// Основная функция: сбор информации о всех физических сетевых интерфейсах
+pub fn collect_network_info(config: &NetworkConfig) -> Vec<NetworkInterfaceInfo> {
+    let mut interfaces = Vec::new();
+    let net_path = Path::new("/sys/class/net");
+
+    let entries = match fs::read_dir(net_path) {
+        Ok(e) => e,
+        Err(err) => {
+            warn!("Не удалось прочитать /sys/class/net: {}", err);
+            return interfaces;
+        }
+    };
+
+    let ip_map = if config.collect_ip {
+        collect_ip_addresses()
+    } else {
+        HashMap::new()
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+
+        if should_skip_interface(&name, config) {
+            continue;
+        }
+
+        let iface_path = entry.path();
+
+        // MAC
+        let mac = read_sys_str(&iface_path.join("address"))
+            .map(|s| parse_mac(&s))
+            .unwrap_or_default();
+
+        // Speed (может отсутствовать для виртуальных и down-интерфейсов)
+        let speed_mbps = read_sys_str(&iface_path.join("speed"))
+            .and_then(|s| parse_speed_mbps(&s));
+
+        // Duplex
+        let duplex = read_sys_str(&iface_path.join("duplex"))
+            .and_then(|s| parse_duplex(&s));
+
+        // Operstate
+        let operstate = read_sys_str(&iface_path.join("operstate"))
+            .map(|s| parse_operstate(&s))
+            .unwrap_or_else(|| "unknown".to_string());
+
+        // Flags (для определения UP на PPP и других интерфейсах с operstate=unknown)
+        let flags = read_sys_str(&iface_path.join("flags"))
+            .map(|s| parse_interface_flags(&s))
+            .unwrap_or(0);
+
+        // IP адреса
+        let (ipv4, ipv6) = ip_map
+            .get(&name)
+            .cloned()
+            .unwrap_or_else(|| (Vec::new(), Vec::new()));
+
+        interfaces.push(NetworkInterfaceInfo {
+            name,
+            mac,
+            speed_mbps,
+            duplex,
+            operstate,
+            flags,       // <-- ДОБАВЛЕНО
+            ipv4,
+            ipv6,
+        });
+    }
+
+    // Сортируем для стабильного порядка метрик
+    interfaces.sort_by(|a, b| a.name.cmp(&b.name));
+    interfaces
+}
+
+/// Сбор I/O статистики для всех интерфейсов (без фильтрации)
+pub fn collect_network_io_stats(config: &NetworkConfig) -> HashMap<String, NetworkIoStats> {
+    let mut stats = HashMap::new();
+    let net_path = Path::new("/sys/class/net");
+
+    let entries = match fs::read_dir(net_path) {
+        Ok(e) => e,
+        Err(_) => return stats,
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+
+        if should_skip_interface(&name, config) {
+            continue;
+        }
+
+        let io_stats = read_interface_statistics(&entry.path());
+        stats.insert(name, io_stats);
+    }
+
+    stats
+}
+
+// ==============================
+// COLLECTOR IMPLEMENTATION
+// ==============================
+
+pub struct NetworkCollector {
+    hostname: String,
+    config: NetworkConfig,
+}
+
+impl NetworkCollector {
+    pub fn new(config: NetworkConfig, hostname: String) -> Self {
+        Self { config, hostname }
+    }
+}
+
+#[async_trait]
+impl Collector for NetworkCollector {
+    fn name(&self) -> &'static str {
+        "network"
+    }
+
+    async fn collect(&self, meter: &Meter) -> Result<()> {
+        let interfaces = collect_network_info(&self.config);
+        let io_stats = collect_network_io_stats(&self.config);
+
+        // ── 1. Информационная метрика (аналог node_network_info) ──
+        let info_gauge = meter
+            .f64_gauge("system.network.info")
+            .with_description("Network interface metadata (always 1)")
+            .with_unit("1")
+            .build();
+
+        for iface in &interfaces {
+            // Объединяем IP адреса через запятую (Prometheus label может содержать строки)
+            let ipv4_str = if iface.ipv4.is_empty() {
+                "none".to_string()
+            } else {
+                iface.ipv4.join(",")
+            };
+            let ipv6_str = if iface.ipv6.is_empty() {
+                "none".to_string()
+            } else {
+                iface.ipv6.join(",")
+            };
+            let speed_str = iface
+                .speed_mbps
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let duplex_str = iface.duplex.clone().unwrap_or_else(|| "unknown".to_string());
+            let mac_str = if iface.mac.is_empty() {
+                "unknown".to_string()
+            } else {
+                iface.mac.clone()
+            };
+
+            let attrs = [
+                KeyValue::new("host_name", self.hostname.clone()),
+                KeyValue::new("interface", iface.name.clone()),
+                KeyValue::new("mac", mac_str),
+                KeyValue::new("speed_mbps", speed_str),
+                KeyValue::new("duplex", duplex_str),
+                KeyValue::new("ipv4", ipv4_str),
+                KeyValue::new("ipv6", ipv6_str),
+            ];
+
+            info_gauge.record(1.0, &attrs);
+
+            debug!(
+                interface = %iface.name,
+                mac = %iface.mac,
+                speed = ?iface.speed_mbps,
+                ipv4 = ?iface.ipv4,
+                operstate = %iface.operstate,
+                "Метрики сетевого интерфейса отправлены"
+            );
+        }
+
+        // ── 2. Статус интерфейса (up=1, down=0) ──
+        let up_gauge = meter
+            .f64_gauge("system.network.up")
+            .with_description("Network interface operational status (1=up, 0=down)")
+            .with_unit("1")
+            .build();
+
+        for iface in &interfaces {
+            let attrs = [
+                KeyValue::new("host_name", self.hostname.clone()),
+                KeyValue::new("interface", iface.name.clone()),
+            ];
+            // ✅ Теперь используем комбинированную проверку operstate + flags
+            let value: f64 = if is_interface_up(&iface.operstate, iface.flags) { 1.0 } else { 0.0 };
+            up_gauge.record(value, &attrs);
+        }
+
+        // ── 3. I/O статистика (cumulative counters) ──
+        let rx_bytes_counter = meter
+            .u64_counter("system.network.io.rx_bytes")
+            .with_description("Total bytes received on interface")
+            .with_unit("By")
+            .build();
+
+        let tx_bytes_counter = meter
+            .u64_counter("system.network.io.tx_bytes")
+            .with_description("Total bytes transmitted from interface")
+            .with_unit("By")
+            .build();
+
+        let rx_packets_counter = meter
+            .u64_counter("system.network.io.rx_packets")
+            .with_description("Total packets received on interface")
+            .build();
+
+        let tx_packets_counter = meter
+            .u64_counter("system.network.io.tx_packets")
+            .with_description("Total packets transmitted from interface")
+            .build();
+
+        let rx_errors_counter = meter
+            .u64_counter("system.network.io.rx_errors")
+            .with_description("Total receive errors on interface")
+            .build();
+
+        let tx_errors_counter = meter
+            .u64_counter("system.network.io.tx_errors")
+            .with_description("Total transmit errors on interface")
+            .build();
+
+        let rx_dropped_counter = meter
+            .u64_counter("system.network.io.rx_dropped")
+            .with_description("Total packets dropped on receive")
+            .build();
+
+        let tx_dropped_counter = meter
+            .u64_counter("system.network.io.tx_dropped")
+            .with_description("Total packets dropped on transmit")
+            .build();
+
+        for (iface_name, io) in &io_stats {
+            let attrs = [
+                KeyValue::new("host_name", self.hostname.clone()),
+                KeyValue::new("interface", iface_name.clone()),
+            ];
+
+            rx_bytes_counter.add(io.rx_bytes, &attrs);
+            tx_bytes_counter.add(io.tx_bytes, &attrs);
+            rx_packets_counter.add(io.rx_packets, &attrs);
+            tx_packets_counter.add(io.tx_packets, &attrs);
+            rx_errors_counter.add(io.rx_errors, &attrs);
+            tx_errors_counter.add(io.tx_errors, &attrs);
+            rx_dropped_counter.add(io.rx_dropped, &attrs);
+            tx_dropped_counter.add(io.tx_dropped, &attrs);
+        }
+
+        Ok(())
+    }
+}
+</file>
+
+<file path="otlp-sys-agent/src/telemetry.rs">
+use crate::config::AppConfig;
+use anyhow::Result;
+use opentelemetry::KeyValue;
+use opentelemetry_otlp::{MetricExporter, WithExportConfig};
+use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
+use opentelemetry_sdk::Resource;
+use std::time::Duration;
+
+pub fn init_meter_provider(config: &AppConfig) -> Result<SdkMeterProvider> {
+    let hostname = config.get_hostname();
+
+    // 1. Экспортёр OTLP over HTTP (теперь использует блокирующий reqwest под капотом)
+    let exporter = MetricExporter::builder()
+        .with_http()
+        .with_endpoint(&config.otlp.endpoint)
+        .with_timeout(Duration::from_secs(config.otlp.timeout_secs))
+        .build()?;
+
+    // 2. PeriodicReader принимает ТОЛЬКО exporter.
+    // Runtime больше не передается — reader сам создаст std::thread.
+    let reader = PeriodicReader::builder(exporter)
+        .with_interval(Duration::from_secs(config.agent.interval_secs))
+        .build();
+
+    // 3. Resource создается через builder (API 0.32.x)
+    let resource = Resource::builder()
+        .with_attribute(KeyValue::new("service.name", "otlp-sys-agent"))
+        .with_attribute(KeyValue::new("host.name", hostname))
+        .build();
+
+    // 4. Сборка MeterProvider
+    let provider = SdkMeterProvider::builder()
+        .with_resource(resource)
+        .with_reader(reader)
+        .build();
+
+    Ok(provider)
+}
+</file>
+
+<file path="otlp-sys-agent/tests/disk_test.rs">
+// tests/disk_test.rs
+
+use otlp_sys_agent::collectors::disk::{
+    parse_proc_partitions, find_partitions, calculate_unallocated, should_skip_device,
+};
+use otlp_sys_agent::config::DiskConfig;
+use std::collections::HashMap;
+
+/// Реалистичный вывод /proc/partitions
+fn mock_proc_partitions() -> &'static str {
+    r#"major minor  #blocks  name
+
+   8        0  976762584 sda
+   8        1  974761984 sda1
+   8        2    2000000 sda2
+   8       16  488386584 sdb
+   8       17  488386584 sdb1
+ 259        0 1000204886 nvme0n1
+ 259        1  512000000 nvme0n1p1
+ 259        2  488204886 nvme0n1p2
+ 253        0  500000000 dm-0
+ 253        1  400000000 dm-1
+   7        0    4096000 loop0
+ 252        0   16777216 zram0
+"#
+}
+
+#[test]
+fn test_parse_proc_partitions_sizes() {
+    let map = parse_proc_partitions(mock_proc_partitions());
+
+    // sda: 976762584 blocks * 1024 = 1000204886016 bytes
+    assert_eq!(map.get("sda"), Some(&(976762584u64 * 1024)));
+    // sda1: 974761984 * 1024
+    assert_eq!(map.get("sda1"), Some(&(974761984u64 * 1024)));
+    // nvme0n1
+    assert_eq!(map.get("nvme0n1"), Some(&(1000204886u64 * 1024)));
+    // dm-0 тоже парсится
+    assert_eq!(map.get("dm-0"), Some(&(500000000u64 * 1024)));
+}
+
+#[test]
+fn test_parse_proc_partitions_count() {
+    let map = parse_proc_partitions(mock_proc_partitions());
+    // sda, sda1, sda2, sdb, sdb1, nvme0n1, nvme0n1p1, nvme0n1p2, dm-0, dm-1, loop0, zram0
+    assert_eq!(map.len(), 12);
+}
+
+#[test]
+fn test_parse_proc_partitions_empty() {
+    let map = parse_proc_partitions("");
+    assert!(map.is_empty());
+}
+
+#[test]
+fn test_parse_proc_partitions_header_only() {
+    let content = "major minor  #blocks  name\n\n";
+    let map = parse_proc_partitions(content);
+    assert!(map.is_empty());
+}
+
+// ─── find_partitions ───
+
+#[test]
+fn test_find_partitions_sata() {
+    let map = parse_proc_partitions(mock_proc_partitions());
+    let parts = find_partitions("sda", &map);
+
+    assert_eq!(parts.len(), 2);
+    assert_eq!(parts[0].0, "sda1");
+    assert_eq!(parts[1].0, "sda2");
+}
+
+#[test]
+fn test_find_partitions_nvme() {
+    let map = parse_proc_partitions(mock_proc_partitions());
+    let parts = find_partitions("nvme0n1", &map);
+
+    // NVMe использует суффикс "p": nvme0n1p1, nvme0n1p2
+    assert_eq!(parts.len(), 2);
+    assert_eq!(parts[0].0, "nvme0n1p1");
+    assert_eq!(parts[1].0, "nvme0n1p2");
+}
+
+#[test]
+fn test_find_partitions_no_partitions() {
+    let mut empty_map = HashMap::new();
+    empty_map.insert("sdc".to_string(), 1000000000u64);
+
+    let parts = find_partitions("sdc", &empty_map);
+    assert!(parts.is_empty());
+}
+
+#[test]
+fn test_find_partitions_does_not_match_similar_names() {
+    let mut map = HashMap::new();
+    map.insert("sda".to_string(), 1000u64);
+    map.insert("sda1".to_string(), 500u64);
+    map.insert("sdaa".to_string(), 200u64);  // НЕ раздел sda!
+    map.insert("sdab".to_string(), 300u64);  // НЕ раздел sda!
+
+    let parts = find_partitions("sda", &map);
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0].0, "sda1");
+}
+
+// ─── calculate_unallocated ───
+
+#[test]
+fn test_calculate_unallocated_with_free_space() {
+    // Диск 1TB, разделы занимают 900GB
+    let total = 1000 * 1024 * 1024 * 1024; // 1 TB
+    let partitions = vec![
+        ("sda1".to_string(), 500 * 1024 * 1024 * 1024),
+        ("sda2".to_string(), 400 * 1024 * 1024 * 1024),
+    ];
+
+    let unallocated = calculate_unallocated(total, &partitions);
+    assert_eq!(unallocated, 100 * 1024 * 1024 * 1024); // 100 GB свободно
+}
+
+#[test]
+fn test_calculate_unallocated_fully_partitioned() {
+    let total = 1000u64 * 1024 * 1024 * 1024;
+    let partitions = vec![
+        ("sda1".to_string(), total), // Весь диск занят одним разделом
+    ];
+
+    let unallocated = calculate_unallocated(total, &partitions);
+    assert_eq!(unallocated, 0);
+}
+
+#[test]
+fn test_calculate_unallocated_empty_disk() {
+    let total = 1000u64 * 1024 * 1024 * 1024;
+    let partitions: Vec<(String, u64)> = vec![];
+
+    let unallocated = calculate_unallocated(total, &partitions);
+    assert_eq!(unallocated, total); // Весь диск неразмечен
+}
+
+#[test]
+fn test_calculate_unallocated_overflow_protection() {
+    // Сумма разделов > размера диска (не должно паниковать)
+    let total = 100u64;
+    let partitions = vec![
+        ("sda1".to_string(), 80u64),
+        ("sda2".to_string(), 80u64), // В сумме 160 > 100
+    ];
+
+    let unallocated = calculate_unallocated(total, &partitions);
+    assert_eq!(unallocated, 0); // saturating_sub защищает от underflow
+}
+
+// ─── should_skip_device ───
+
+#[test]
+fn test_skip_loop_devices() {
+    let config = DiskConfig::default();
+    assert!(should_skip_device("loop0", &config));
+    assert!(should_skip_device("loop15", &config));
+}
+
+#[test]
+fn test_skip_ram_devices() {
+    let config = DiskConfig::default();
+    assert!(should_skip_device("ram0", &config));
+    assert!(should_skip_device("zram0", &config));
+}
+
+#[test]
+fn test_skip_device_mapper_when_enabled() {
+    let config = DiskConfig {
+        ignore_device_mapper: true,
+        ..Default::default()
+    };
+    assert!(should_skip_device("dm-0", &config));
+    assert!(should_skip_device("dm-1", &config));
+}
+
+#[test]
+fn test_keep_device_mapper_when_disabled() {
+    let config = DiskConfig {
+        ignore_device_mapper: false,
+        ..Default::default()
+    };
+    assert!(!should_skip_device("dm-0", &config));
+}
+
+#[test]
+fn test_keep_real_disks() {
+    let config = DiskConfig::default();
+    assert!(!should_skip_device("sda", &config));
+    assert!(!should_skip_device("nvme0n1", &config));
+    assert!(!should_skip_device("vda", &config));
+}
+
+#[test]
+fn test_skip_custom_ignore_list() {
+    let config = DiskConfig {
+        ignore_devices: vec!["sr0".to_string(), "sdc".to_string()],
+        ..Default::default()
+    };
+    assert!(should_skip_device("sr0", &config));
+    assert!(should_skip_device("sdc", &config));
+    assert!(!should_skip_device("sda", &config));
+}
+</file>
+
+<file path=".gitignore">
+# Rust / Cargo build artifacts
+/target/
+**/target/
+Cargo.lock
+
+# Taskfile output & Release Archives
+/dist/
+*.tar.gz
+*.zip
+
+# Local environment variables and secrets
+.env
+!.env.example
+
+# IDEs & Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.zed/
+
+# System files
+.DS_Store
+otlp-sys-agent/.tree.txt
+</file>
+
+<file path="otlp-sys-agent/tests/network_test.rs">
+// tests/network_test.rs
+
+use otlp_sys_agent::collectors::network::{
+    collect_network_info, is_interface_up, parse_duplex, parse_interface_flags, parse_mac,
+    parse_operstate, parse_speed_mbps, parse_statistics, should_skip_interface
+};
+use otlp_sys_agent::config::NetworkConfig;
+use std::collections::HashMap;
+
+// ─── parse_mac ───
+
+#[test]
+fn test_parse_mac_normalizes() {
+    assert_eq!(parse_mac("AA:BB:CC:DD:EE:FF\n"), "aa:bb:cc:dd:ee:ff");
+    assert_eq!(parse_mac("00:11:22:33:44:55"), "00:11:22:33:44:55");
+}
+
+#[test]
+fn test_parse_mac_empty() {
+    assert_eq!(parse_mac(""), "");
+}
+
+// ─── parse_speed_mbps ───
+
+#[test]
+fn test_parse_speed_valid() {
+    assert_eq!(parse_speed_mbps("1000"), Some(1000));
+    assert_eq!(parse_speed_mbps("100\n"), Some(100));
+    assert_eq!(parse_speed_mbps("2500"), Some(2500));
+    assert_eq!(parse_speed_mbps("10000"), Some(10000)); // 10G
+}
+
+#[test]
+fn test_parse_speed_invalid() {
+    assert_eq!(parse_speed_mbps("-1"), None);
+    assert_eq!(parse_speed_mbps("0"), None);
+    assert_eq!(parse_speed_mbps("unknown"), None);
+    assert_eq!(parse_speed_mbps("4294961"), None); // virtio magic
+    assert_eq!(parse_speed_mbps(""), None);
+}
+
+// ─── parse_duplex ───
+
+#[test]
+fn test_parse_duplex() {
+    assert_eq!(parse_duplex("full"), Some("full".to_string()));
+    assert_eq!(parse_duplex("half"), Some("half".to_string()));
+    assert_eq!(parse_duplex("unknown"), None);
+    assert_eq!(parse_duplex(""), None);
+}
+
+// ─── parse_operstate ───
+
+#[test]
+fn test_parse_operstate() {
+    assert_eq!(parse_operstate("up"), "up");
+    assert_eq!(parse_operstate("down"), "down");
+    assert_eq!(parse_operstate("unknown"), "unknown");
+    assert_eq!(parse_operstate(""), "unknown");
+}
+
+// ─── parse_interface_flags ───
+
+#[test]
+fn test_parse_flags_with_prefix() {
+    assert_eq!(parse_interface_flags("0x11091"), 0x11091);
+}
+
+#[test]
+fn test_parse_flags_without_prefix() {
+    assert_eq!(parse_interface_flags("11091"), 0x11091);
+}
+
+#[test]
+fn test_parse_flags_with_whitespace() {
+    assert_eq!(parse_interface_flags("  0x1091\n"), 0x1091);
+}
+
+#[test]
+fn test_parse_flags_empty() {
+    assert_eq!(parse_interface_flags(""), 0);
+}
+
+#[test]
+fn test_parse_flags_invalid() {
+    assert_eq!(parse_interface_flags("not_hex"), 0);
+}
+
+// ─── is_interface_up ───
+
+#[test]
+fn test_up_operstate_is_up() {
+    assert!(is_interface_up("up", 0));
+}
+
+#[test]
+fn test_down_operstate_is_down() {
+    assert!(!is_interface_up("down", 0x11091));
+}
+
+#[test]
+fn test_unknown_with_iff_up_is_up() {
+    // PPP: operstate=unknown, но IFF_UP установлен
+    // ppp0: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP>
+    // 0x1 (UP) | 0x10 (POINTOPOINT) | 0x80 (NOARP) | 0x1000 (MULTICAST) | 0x10000 (LOWER_UP)
+    let flags = 0x11091;
+    assert!(is_interface_up("unknown", flags));
+}
+
+#[test]
+fn test_unknown_without_iff_up_is_down() {
+    // Интерфейс выключен: operstate=unknown, IFF_UP не установлен
+    // Только POINTOPOINT | NOARP | MULTICAST, без IFF_UP
+    let flags = 0x11080;
+    assert!(!is_interface_up("unknown", flags));
+}
+
+#[test]
+fn test_unknown_with_only_iff_up() {
+    // Только IFF_UP, без LOWER_UP (интерфейс поднят, но кабель не подключён)
+    assert!(is_interface_up("unknown", 0x1));
+}
+
+#[test]
+fn test_lowerlayerdown_state_checks_flags() {
+    // operstate=lowerlayerdown → проверяем флаги
+    let flags_up = 0x1; // IFF_UP
+    assert!(is_interface_up("lowerlayerdown", flags_up));
+
+    let flags_down = 0x0;
+    assert!(!is_interface_up("lowerlayerdown", flags_down));
+}
+
+#[test]
+fn test_zero_flags_is_down() {
+    assert!(!is_interface_up("unknown", 0));
+}
+
+// ─── should_skip_interface ───
+
+#[test]
+fn test_skip_loopback() {
+    let config = NetworkConfig::default();
+    assert!(should_skip_interface("lo", &config));
+}
+
+#[test]
+fn test_skip_docker_interfaces() {
+    let config = NetworkConfig::default();
+    assert!(should_skip_interface("docker0", &config));
+    assert!(should_skip_interface("br-1234abcd", &config));
+    assert!(should_skip_interface("veth1234567", &config));
+}
+
+#[test]
+fn test_skip_wireguard() {
+    let config = NetworkConfig::default();
+    assert!(should_skip_interface("wg0", &config));
+    assert!(should_skip_interface("wg-server", &config));
+}
+
+#[test]
+fn test_keep_physical_interfaces() {
+    let config = NetworkConfig::default();
+    assert!(!should_skip_interface("eth0", &config));
+    assert!(!should_skip_interface("enp3s0", &config));
+    assert!(!should_skip_interface("eno1", &config));
+    assert!(!should_skip_interface("wlan0", &config));
+    assert!(!should_skip_interface("bond0", &config));
+}
+
+#[test]
+fn test_skip_exact_match() {
+    let config = NetworkConfig {
+        ignore_exact: vec!["eth0".to_string(), "dummy0".to_string()],
+        ..Default::default()
+    };
+    assert!(should_skip_interface("eth0", &config));
+    assert!(should_skip_interface("dummy0", &config));
+    assert!(!should_skip_interface("eth1", &config));
+}
+
+#[test]
+fn test_skip_custom_prefix() {
+    let config = NetworkConfig {
+        ignore_interfaces: vec!["custom".to_string()],
+        ..Default::default()
+    };
+    assert!(should_skip_interface("custom0", &config));
+    assert!(should_skip_interface("customnet", &config));
+    assert!(!should_skip_interface("eth0", &config));
+}
+
+// ─── parse_statistics ───
+
+#[test]
+fn test_parse_statistics_full() {
+    let mut map = HashMap::new();
+    map.insert("rx_bytes".to_string(), "1000000".to_string());
+    map.insert("tx_bytes".to_string(), "2000000".to_string());
+    map.insert("rx_packets".to_string(), "1000".to_string());
+    map.insert("tx_packets".to_string(), "2000".to_string());
+    map.insert("rx_errors".to_string(), "5".to_string());
+    map.insert("tx_errors".to_string(), "3".to_string());
+    map.insert("rx_dropped".to_string(), "1".to_string());
+    map.insert("tx_dropped".to_string(), "2".to_string());
+
+    let stats = parse_statistics(&map);
+    assert_eq!(stats.rx_bytes, 1000000);
+    assert_eq!(stats.tx_bytes, 2000000);
+    assert_eq!(stats.rx_packets, 1000);
+    assert_eq!(stats.tx_packets, 2000);
+    assert_eq!(stats.rx_errors, 5);
+    assert_eq!(stats.tx_errors, 3);
+    assert_eq!(stats.rx_dropped, 1);
+    assert_eq!(stats.tx_dropped, 2);
+}
+
+#[test]
+fn test_parse_statistics_missing_fields() {
+    let mut map = HashMap::new();
+    map.insert("rx_bytes".to_string(), "500".to_string());
+    // tx_bytes, packets и т.д. отсутствуют
+
+    let stats = parse_statistics(&map);
+    assert_eq!(stats.rx_bytes, 500);
+    assert_eq!(stats.tx_bytes, 0);
+    assert_eq!(stats.rx_packets, 0);
+}
+
+#[test]
+fn test_parse_statistics_empty_map() {
+    let map = HashMap::new();
+    let stats = parse_statistics(&map);
+    assert_eq!(stats.rx_bytes, 0);
+    assert_eq!(stats.tx_bytes, 0);
+}
+
+// ─── collect_network_info (интеграционный) ───
+
+#[test]
+fn test_collect_network_info_integration() {
+    let config = NetworkConfig {
+        enabled: true,
+        ignore_interfaces: vec!["lo".to_string()], // убираем loopback для чистоты
+        ignore_exact: vec![],
+        collect_ip: true,
+        ..Default::default()
+    };
+
+    let interfaces = collect_network_info(&config);
+
+    // На любой Linux-системе должен быть хотя бы один не-loopback интерфейс
+    assert!(
+        !interfaces.is_empty(),
+        "Ожидается хотя бы один сетевой интерфейс"
+    );
+
+    // Проверяем, что loopback отфильтрован
+    for iface in &interfaces {
+        assert_ne!(iface.name, "lo", "Loopback должен быть отфильтрован");
+        // MAC должен быть валидным (или пустым для виртуальных)
+        if !iface.mac.is_empty() {
+            assert!(
+                iface.mac.contains(':'),
+                "MAC {} не выглядит валидным",
+                iface.mac
+            );
+        }
+    }
+}
+
+#[test]
+fn test_collect_network_info_without_ip() {
+    let config = NetworkConfig {
+        enabled: true,
+        ignore_interfaces: vec!["lo".to_string()],
+        ignore_exact: vec![],
+        collect_ip: false,
+        ..Default::default()
+    };
+
+    let interfaces = collect_network_info(&config);
+
+    for iface in &interfaces {
+        assert!(iface.ipv4.is_empty(), "IPv4 не должен собираться");
+        assert!(iface.ipv6.is_empty(), "IPv6 не должен собираться");
+    }
+}
+
+#[test]
+fn test_collect_network_info_flags_populated() {
+    let config = NetworkConfig {
+        enabled: true,
+        ignore_interfaces: vec!["lo".to_string()],
+        ignore_exact: vec![],
+        collect_ip: false,
+        ..Default::default()
+    };
+
+    let interfaces = collect_network_info(&config);
+
+    // Проверяем, что флаги прочитаны (не все нулевые для UP интерфейсов)
+    for iface in &interfaces {
+        if iface.operstate == "up" {
+            // UP интерфейс должен иметь IFF_UP флаг
+            assert!(
+                iface.flags & 0x1 != 0,
+                "Интерфейс {} в состоянии up, но IFF_UP не установлен (flags=0x{:x})",
+                iface.name,
+                iface.flags
+            );
+        }
+    }
+}
 </file>
 
 <file path="otlp-sys-agent/src/config.rs">
@@ -2323,6 +4390,15 @@ pub struct CollectorsConfig {
 
     #[serde(default)]
     pub process: ProcessConfig,
+
+    #[serde(default)]
+    pub filesystem: FilesystemConfig,
+
+    #[serde(default)]
+    pub disk: DiskConfig,
+
+    #[serde(default)]
+    pub network: NetworkConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -2387,126 +4463,139 @@ impl Default for ProcessConfig {
     }
 }
 
-fn default_true() -> bool {
-    true
+// DiskConfig:
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct DiskConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Игнорировать device-mapper устройства (dm-0, dm-1 — LVM)
+    #[serde(default = "default_true")]
+    pub ignore_device_mapper: bool,
+    /// Список устройств для игнорирования
+    #[serde(default)]
+    pub ignore_devices: Vec<String>,
+    /// Собирать I/O статистику (read/write counters)
+    #[serde(default = "default_true")]
+    pub collect_io: bool,
 }
-</file>
 
-<file path="otlp-sys-agent/src/main.rs">
-use anyhow::Result;
-use opentelemetry::metrics::MeterProvider;
-use otlp_sys_agent::collector::CollectorRegistry;
-use otlp_sys_agent::collectors::iptables::IptablesCollector;
-use otlp_sys_agent::collectors::process::ProcessCollector;
-use otlp_sys_agent::collectors::temperature::SysfsTempCollector;
-use otlp_sys_agent::config::AppConfig;
-use otlp_sys_agent::telemetry;
-use std::time::Duration;
-use tokio::signal;
-use tracing::{info, warn};
-use tracing_subscriber::EnvFilter;
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    // 1. Загрузка конфигурации
-    let cfg = AppConfig::load()?;
-
-    // 2. Инициализация логирования
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(&cfg.agent.log_level)),
-        )
-        .init();
-
-    info!(
-        hostname = %cfg.get_hostname(),
-        endpoint = %cfg.otlp.endpoint,
-        interval = cfg.agent.interval_secs,
-        "Запуск OTLP System Agent"
-    );
-
-    // 3. Инициализация OpenTelemetry
-    let meter_provider = telemetry::init_meter_provider(&cfg)?;
-    let meter = meter_provider.meter("otlp-sys-agent");
-
-    // 4. Регистрация активных коллекторов
-    let hostname = cfg.get_hostname();
-    let mut registry = CollectorRegistry::new();
-
-    if cfg.collectors.temperature.enabled {
-        registry.register(SysfsTempCollector::new(hostname.clone()));
-    }
-
-    // Регистрация iptables коллектора
-    if cfg.collectors.iptables.enabled {
-        registry.register(IptablesCollector::new(
-            cfg.collectors.iptables.clone(),
-            hostname.clone(),
-        ));
-    }
-
-    // Регистрация process коллектора
-    if cfg.collectors.process.enabled {
-        registry.register(ProcessCollector::new(hostname.clone()));
-    }
-
-    if registry.is_empty() {
-        warn!("Нет активных коллекторов в конфигурации! Завершение работы.");
-        return Ok(());
-    }
-
-    // 5. Главный асинхронный цикл сбора
-    let mut ticker = tokio::time::interval(Duration::from_secs(cfg.agent.interval_secs));
-
-    info!("Агент успешно запущен. Для остановки нажмите Ctrl+C.");
-
-    loop {
-        tokio::select! {
-            _ = ticker.tick() => {
-                registry.collect_all(&meter).await;
-            }
-            _ = shutdown_signal() => {
-                info!("Получен сигнал остановки. Сброс метрик и выключение...");
-                break;
-            }
+impl Default for DiskConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ignore_device_mapper: true,
+            ignore_devices: Vec::new(),
+            collect_io: true,
         }
     }
-
-    // 6. Graceful shutdown: принудительный флаш (flush) невыгруженных метрик
-    if let Err(e) = meter_provider.shutdown() {
-        tracing::error!(error = %e, "Ошибка при закрытии OTLP MeterProvider");
-    } else {
-        info!("OpenTelemetry MeterProvider корректно завершил работу.");
-    }
-
-    info!("Агент остановлен.");
-    Ok(())
 }
 
-/// Асинхронный перехват сигналов SIGINT (Ctrl+C) и SIGTERM (systemctl stop)
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        signal::ctrl_c()
-            .await
-            .expect("Не удалось установить обработчик Ctrl+C");
-    };
+// NetworkConfig:
 
-    #[cfg(unix)]
-    let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("Не удалось установить обработчик SIGTERM")
-            .recv()
-            .await;
-    };
+#[derive(Debug, Deserialize, Clone)]
+pub struct NetworkConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Префиксы интерфейсов для игнорирования
+    #[serde(default = "default_ignore_interfaces")]
+    pub ignore_interfaces: Vec<String>,
+    /// Точные имена интерфейсов для игнорирования
+    #[serde(default)]
+    pub ignore_exact: Vec<String>,
+    /// Собирать IP-адреса (требует getifaddrs)
+    #[serde(default = "default_true")]
+    pub collect_ip: bool,
+}
 
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ignore_interfaces: default_ignore_interfaces(),
+            ignore_exact: Vec::new(),
+            collect_ip: true,
+        }
     }
+}
+
+fn default_ignore_interfaces() -> Vec<String> {
+    vec![
+        "lo".to_string(),
+        "veth".to_string(),
+        "docker".to_string(),
+        "br-".to_string(),
+        "virbr".to_string(),
+        "vnet".to_string(),
+        "tun".to_string(),
+        "tap".to_string(),
+        "wg".to_string(),
+        "cni".to_string(),
+        "flannel".to_string(),
+    ]
+}
+
+// FilesystemConfig:
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct FilesystemConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_ignore_mount_points")]
+    pub ignore_mount_points: Vec<String>,
+    #[serde(default = "default_ignore_fs_types")]
+    pub ignore_fs_types: Vec<String>,
+}
+
+impl Default for FilesystemConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ignore_mount_points: default_ignore_mount_points(),
+            ignore_fs_types: default_ignore_fs_types(),
+        }
+    }
+}
+
+fn default_ignore_mount_points() -> Vec<String> {
+    vec![
+        "/proc".to_string(),
+        "/sys".to_string(),
+        "/dev".to_string(),
+        "/run".to_string(),
+        "/snap".to_string(),
+    ]
+}
+
+fn default_ignore_fs_types() -> Vec<String> {
+    vec![
+        "tmpfs".to_string(),
+        "devtmpfs".to_string(),
+        "squashfs".to_string(),
+        "overlay".to_string(),
+        "proc".to_string(),
+        "sysfs".to_string(),
+        "cgroup".to_string(),
+        "cgroup2".to_string(),
+        "devpts".to_string(),
+        "mqueue".to_string(),
+        "hugetlbfs".to_string(),
+        "debugfs".to_string(),
+        "tracefs".to_string(),
+        "securityfs".to_string(),
+        "pstore".to_string(),
+        "bpf".to_string(),
+        "autofs".to_string(),
+        "binfmt_misc".to_string(),
+        "rpc_pipefs".to_string(),
+        "nsfs".to_string(),
+        "ramfs".to_string(),
+        "fuse.lxcfs".to_string(),
+    ]
+}
+
+fn default_true() -> bool {
+    true
 }
 </file>
 
@@ -2554,6 +4643,37 @@ collectors:
     # 4. Пороги отсечения "шумных" мелких процессов
     min_cpu_percent: 0.0
     min_memory_mb: 0
+  filesystem:
+      enabled: true
+      ignore_mount_points:
+        - /proc
+        - /sys
+        - /dev
+        - /run
+        - /snap
+      ignore_fs_types:
+        - tmpfs
+        - devtmpfs
+        - squashfs
+        - overlay
+  disk:
+      enabled: true
+      ignore_device_mapper: true    # Игнорировать LVM (dm-0, dm-1)
+      ignore_devices: []            # Пример: ["sr0"] для CD-ROM
+      collect_io: true              # Собирать read/write counters
+  network:
+      enabled: true
+      ignore_interfaces:
+        - lo
+        - veth
+        - docker
+        - br-
+        - virbr
+        - tun
+        - tap
+        - wg
+      ignore_exact: []
+      collect_ip: true
 </file>
 
 <file path="README.md">
@@ -2699,54 +4819,232 @@ task release
 (Скомпилирует бинарники под x86_64 и ARM64 через Zig, сгенерирует `install.sh`, `systemd.service` и упакует всё в `dist/otlp-sys-agent-release.tar.gz`).
 
 ## Пример дашборда представлен в `GrafanaDashBoardExample.json` и `GrafanaCPUTempDashBoardExample.json`
+
+
+##  Пример PromQL запросов для Grafana для filesystem
+```
+# Общий объём диска (в GB)
+system_filesystem_total_bytes{host_name="server-01", mountpoint="/"} / 1024/1024/1024
+
+# Занято (в GB)
+system_filesystem_used_bytes{host_name="server-01", mountpoint="/"} / 1024/1024/1024
+
+# Свободно (в GB)
+system_filesystem_free_bytes{host_name="server-01", mountpoint="/"} / 1024/1024/1024
+
+# Резерв (неразмеченное место root)
+system_filesystem_reserved_bytes{host_name="server-01"} / 1024/1024/1024
+
+# Процент использования диска
+100 * (system_filesystem_used_bytes / system_filesystem_total_bytes)
+
+# Список всех серверов и их точек монтирования
+group by (host_name, mountpoint, fstype) (system_filesystem_total_bytes)
+```
+
+##  Пример PromQL запросов для Grafana для disk
+```
+# Неразмеченное место на дисках (GB)
+system_disk_unallocated_bytes / 1024/1024/1024
+
+# Скорость чтения с диска (MB/s)
+rate(system_disk_io_read_bytes[5m]) / 1024/1024
+
+# Скорость записи на диск (MB/s)
+rate(system_disk_io_write_bytes[5m]) / 1024/1024
+
+# Утилизация диска (% времени занят)
+rate(system_disk_io_io_time_ms[5m]) / 10
+
+# IOPS (операций в секунду)
+rate(system_disk_io_reads_completed[5m]) + rate(system_disk_io_writes_completed[5m])
+```
+
+##  Пример PromQL запросов для Grafana для Network
+```
+# Скорость RX на выбранном uplink-интерфейсе (bit/s)
+rate(system_network_io_rx_bytes{interface="$interface"}[1m]) * 8
+
+# Скорость TX
+rate(system_network_io_tx_bytes{interface="$interface"}[1m]) * 8
+
+# Процент использования линка (если скорость известна)
+(
+  rate(system_network_io_rx_bytes{interface="$interface"}[1m]) * 8
+  / on(interface) group_left() 
+  (system_network_info * 1000000)  # speed_mbps -> bps
+) * 100
+
+# Ошибки на интерфейсе (rate в секунду)
+rate(system_network_io_rx_errors{interface="$interface"}[5m])
++ rate(system_network_io_tx_errors{interface="$interface"}[5m])
+
+# Drops (сигнал перегрузки буферов)
+rate(system_network_io_rx_dropped{interface="$interface"}[5m])
+
+# Таблица всех серверов и их uplink-интерфейсов
+system_network_info{speed_mbps!="unknown"}
+```
 </file>
 
-<file path="otlp-sys-agent/Cargo.toml">
-[package]
-name = "otlp-sys-agent"
-version = "0.1.3"
-edition = "2021"
-authors = ["Pastorov Nikita <pastopnik@gmail.com>","Google Gemini 3.5 Flash"]
-description = "Lightweight modular OTLP system metrics collector"
+<file path="otlp-sys-agent/src/collectors/mod.rs">
+pub mod iptables;
+pub mod temperature;
+pub mod process;
+pub mod filesystem;
+pub mod disk;
+pub mod network;
+pub mod system;
+</file>
 
-[dependencies]
-# Async Runtime
-tokio = { version = "1.40", features = ["full"] }
-async-trait = "0.1"
+<file path="otlp-sys-agent/src/main.rs">
+use anyhow::Result;
+use opentelemetry::metrics::MeterProvider;
+use otlp_sys_agent::collector::CollectorRegistry;
+use otlp_sys_agent::collectors::iptables::IptablesCollector;
+use otlp_sys_agent::collectors::process::ProcessCollector;
+use otlp_sys_agent::collectors::temperature::SysfsTempCollector;
+use otlp_sys_agent::collectors::filesystem::FilesystemCollector;
+use otlp_sys_agent::collectors::disk::DiskCollector;
+use otlp_sys_agent::collectors::network::NetworkCollector;
+use otlp_sys_agent::collectors::system::SystemCollector;
 
-# OpenTelemetry & OTLP Exporter
-opentelemetry = { version = "0.32.0", features = ["metrics"] }
-opentelemetry_sdk = { version = "0.32.1", features = ["metrics", "rt-tokio"] }
-opentelemetry-otlp = { version = " 0.32.0", features = ["http-proto", "reqwest-client", "reqwest-rustls", "metrics"] }
-# opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic", "metrics"] }
+use otlp_sys_agent::config::AppConfig;
+use otlp_sys_agent::telemetry;
+use std::time::Duration;
+use tokio::signal;
+use tracing::{info, warn};
+use tracing_subscriber::EnvFilter;
 
-# Configuration & Environment
-config = "0.15.25"
-dotenvy = "0.15"
-serde = { version = "1.0", features = ["derive"] }
+#[tokio::main]
+async fn main() -> Result<()> {
+    // 1. Загрузка конфигурации
+    let cfg = AppConfig::load()?;
 
-# Logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+    // 2. Инициализация логирования
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new(&cfg.agent.log_level)),
+        )
+        .init();
 
-# Error handling
-anyhow = "1.0"
-thiserror = "2.0.20"
+    info!(
+        hostname = %cfg.get_hostname(),
+        endpoint = %cfg.otlp.endpoint,
+        interval = cfg.agent.interval_secs,
+        "Запуск OTLP System Agent"
+    );
 
-gethostname = "1.1.0"
-serde_yaml = "0.9.34"
+    // 3. Инициализация OpenTelemetry
+    let meter_provider = telemetry::init_meter_provider(&cfg)?;
+    let meter = meter_provider.meter("otlp-sys-agent");
 
-nix = { version = "0.31.3", features = ["fs"] }
+    // 4. Регистрация активных коллекторов
+    let hostname = cfg.get_hostname();
+    let mut registry = CollectorRegistry::new();
 
-[profile.release]
-opt-level = "z"     # Оптимизация по размеру бинарника
-lto = true          # Link-Time Optimization для максимальной производительности
-codegen-units = 1   # Максимальная оптимизация при сборке
-panic = "abort"     # Убирает стэктрейсы из бинарника (уменьшает размер)
-strip = true        # Автоматически вырезает отладочные символы
+    if cfg.collectors.temperature.enabled {
+        registry.register(SysfsTempCollector::new(hostname.clone()));
+    }
 
-[dev-dependencies]
-tempfile = "3.10"
+    // Регистрация iptables коллектора
+    if cfg.collectors.iptables.enabled {
+        registry.register(IptablesCollector::new(
+            cfg.collectors.iptables.clone(),
+            hostname.clone(),
+        ));
+    }
+
+    // Регистрация process коллектора
+    if cfg.collectors.process.enabled {
+        registry.register(ProcessCollector::new(hostname.clone()));
+    }
+
+    if registry.is_empty() {
+        warn!("Нет активных коллекторов в конфигурации! Завершение работы.");
+        return Ok(());
+    }
+
+    // Регистрация filesystem коллектора
+    if cfg.collectors.filesystem.enabled {
+        registry.register(FilesystemCollector::new(
+            cfg.collectors.filesystem.clone(),
+            hostname.clone(),
+        ));
+    }
+
+    // Регистрация Disk коллектора
+    if cfg.collectors.disk.enabled {
+        registry.register(DiskCollector::new(
+            cfg.collectors.disk.clone(),
+            hostname.clone(),
+        ));
+    }
+
+    // Регистрация Network коллектора
+    if cfg.collectors.network.enabled {
+        registry.register(NetworkCollector::new(
+            cfg.collectors.network.clone(),
+            hostname.clone(),
+        ));
+    }
+
+    // Регистрация System коллектора
+    registry.register(SystemCollector::new(hostname.clone()));
+
+    // 5. Главный асинхронный цикл сбора
+    let mut ticker = tokio::time::interval(Duration::from_secs(cfg.agent.interval_secs));
+
+    info!("Агент успешно запущен. Для остановки нажмите Ctrl+C.");
+
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                registry.collect_all(&meter).await;
+            }
+            _ = shutdown_signal() => {
+                info!("Получен сигнал остановки. Сброс метрик и выключение...");
+                break;
+            }
+        }
+    }
+
+    // 6. Graceful shutdown: принудительный флаш (flush) невыгруженных метрик
+    if let Err(e) = meter_provider.shutdown() {
+        tracing::error!(error = %e, "Ошибка при закрытии OTLP MeterProvider");
+    } else {
+        info!("OpenTelemetry MeterProvider корректно завершил работу.");
+    }
+
+    info!("Агент остановлен.");
+    Ok(())
+}
+
+/// Асинхронный перехват сигналов SIGINT (Ctrl+C) и SIGTERM (systemctl stop)
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("Не удалось установить обработчик Ctrl+C");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("Не удалось установить обработчик SIGTERM")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+}
 </file>
 
 <file path="Taskfile.yml">
@@ -2967,7 +5265,55 @@ tasks:
       # 4. Проставляем тег и публикуем в GitHub
       - git tag -f -a {{.RAW_TAG}} -m "Release {{.RAW_TAG}}"
       - git push origin {{.RAW_TAG}} --force
-      - gh release create {{.RAW_TAG}} {{.DIST_DIR}}/{{.APP_NAME}}-release.tar.gz --title "Release {{.RAW_TAG}}" --notes "Автоматический релиз {{.RAW_TAG}}" --clobber
+      # - gh release create {{.RAW_TAG}} {{.DIST_DIR}}/{{.APP_NAME}}-release.tar.gz --title "Release {{.RAW_TAG}}" --notes "Автоматический релиз {{.RAW_TAG}}" --clobber
+      - gh release create {{.RAW_TAG}} {{.DIST_DIR}}/{{.APP_NAME}}-release.tar.gz --title "Release {{.RAW_TAG}}" --notes "Автоматический релиз {{.RAW_TAG}}"
+</file>
+
+<file path="otlp-sys-agent/Cargo.toml">
+[package]
+name = "otlp-sys-agent"
+version = "0.1.8"
+edition = "2021"
+authors = ["Pastorov Nikita <pastopnik@gmail.com>","Google Gemini 3.5 Flash"]
+description = "Lightweight modular OTLP system metrics collector"
+
+[dependencies]
+# Async Runtime
+tokio = { version = "1.40", features = ["full"] }
+async-trait = "0.1"
+
+# OpenTelemetry & OTLP Exporter
+opentelemetry = { version = "0.32.0", features = ["metrics"] }
+opentelemetry_sdk = { version = "0.32.1", features = ["metrics", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.32.0", features = ["http-proto", "reqwest-blocking-client", "reqwest-rustls", "metrics"] }
+
+# Configuration & Environment
+config = "0.15.25"
+dotenvy = "0.15"
+serde = { version = "1.0", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0.20"
+
+gethostname = "1.1.0"
+serde_yaml = "0.9.34"
+
+nix = { version = "0.31.3", features = ["fs", "net"] }
+
+[profile.release]
+opt-level = "z"     # Оптимизация по размеру бинарника
+lto = true          # Link-Time Optimization для максимальной производительности
+codegen-units = 1   # Максимальная оптимизация при сборке
+panic = "abort"     # Убирает стэктрейсы из бинарника (уменьшает размер)
+strip = true        # Автоматически вырезает отладочные символы
+
+[dev-dependencies]
+tempfile = "3.10"
 </file>
 
 </files>

@@ -2,7 +2,7 @@
 
 use otlp_sys_agent::collectors::network::{
     collect_network_info, is_interface_up, parse_duplex, parse_interface_flags, parse_mac,
-    parse_operstate, parse_speed_mbps, parse_statistics, should_skip_interface, NetworkIoStats,
+    parse_operstate, parse_speed_mbps, parse_statistics, should_skip_interface
 };
 use otlp_sys_agent::config::NetworkConfig;
 use std::collections::HashMap;

@@ -7,7 +7,7 @@ use otlp_sys_agent::collectors::temperature::SysfsTempCollector;
 use otlp_sys_agent::collectors::filesystem::FilesystemCollector;
 use otlp_sys_agent::collectors::disk::DiskCollector;
 use otlp_sys_agent::collectors::network::NetworkCollector;
-
+use otlp_sys_agent::collectors::system::SystemCollector;
 
 use otlp_sys_agent::config::AppConfig;
 use otlp_sys_agent::telemetry;
@@ -89,6 +89,9 @@ async fn main() -> Result<()> {
             hostname.clone(),
         ));
     }
+
+    // Регистрация System коллектора
+    registry.register(SystemCollector::new(hostname.clone()));
 
     // 5. Главный асинхронный цикл сбора
     let mut ticker = tokio::time::interval(Duration::from_secs(cfg.agent.interval_secs));

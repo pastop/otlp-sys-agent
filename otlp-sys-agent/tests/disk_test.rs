@@ -84,8 +84,6 @@ fn test_find_partitions_nvme() {
 
 #[test]
 fn test_find_partitions_no_partitions() {
-    let map = parse_proc_partitions(mock_proc_partitions());
-    // sdb имеет только sdb1, но проверим диск без разделов
     let mut empty_map = HashMap::new();
     empty_map.insert("sdc".to_string(), 1000000000u64);
 

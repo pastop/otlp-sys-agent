@@ -269,7 +269,6 @@ fn default_ignore_interfaces() -> Vec<String> {
 }
 
 // FilesystemConfig:
-
 #[derive(Debug, Deserialize, Clone)]
 pub struct FilesystemConfig {
     #[serde(default = "default_true")]
@@ -278,6 +277,9 @@ pub struct FilesystemConfig {
     pub ignore_mount_points: Vec<String>,
     #[serde(default = "default_ignore_fs_types")]
     pub ignore_fs_types: Vec<String>,
+    /// Включать overlay-ФС (нужно для LXC/Docker-контейнеров с overlayfs-корнем)
+    #[serde(default)]
+    pub include_overlay: bool,
 }
 
 impl Default for FilesystemConfig {
@@ -286,6 +288,7 @@ impl Default for FilesystemConfig {
             enabled: true,
             ignore_mount_points: default_ignore_mount_points(),
             ignore_fs_types: default_ignore_fs_types(),
+            include_overlay: false,
         }
     }
 }

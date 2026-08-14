@@ -49,11 +49,11 @@ collectors:
         - /dev
         - /run
         - /snap
-      ignore_fs_types:
+      include_overlay: true     # ← только для overlayfs-корня
+      ignore_fs_types:          # ← overlay убрать из списка
         - tmpfs
         - devtmpfs
         - squashfs
-        - overlay
   disk:
       enabled: true
       ignore_device_mapper: true    # Игнорировать LVM (dm-0, dm-1)

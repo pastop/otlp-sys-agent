@@ -7,7 +7,9 @@ use async_trait::async_trait;
 use nix::sys::statvfs::{statvfs, FsFlags};
 use opentelemetry::metrics::Meter;
 use opentelemetry::KeyValue;
+use std::collections::HashSet;
 use std::fs;
+use std::os::linux::fs::MetadataExt;
 use std::path::Path;
 use tracing::{debug, warn};
 
@@ -33,44 +35,63 @@ pub struct MountEntry {
     pub fs_type: String,
 }
 
-/// Чистая функция парсинга содержимого /proc/mounts.
-/// Фильтрует ТОЛЬКО по префиксу /dev/ (базовая фильтрация).
-/// НЕ применяет фильтры из конфига — это задача collect_fs_metrics.
-pub fn parse_proc_mounts(content: &str) -> Vec<MountEntry> {
-    let mut entries = Vec::new();
+/// Типы ФС, которые считаем реальным хранилищем,
+/// даже если device не начинается с /dev/ (типично для LXC: ZFS, NFS и т.д.)
+const REAL_FS_TYPES: &[&str] = &[
+    "ext2", "ext3", "ext4", "xfs", "btrfs", "zfs", "f2fs", "reiserfs",
+    "jfs", "vfat", "exfat", "ntfs", "ntfs3", "nfs", "nfs4", "cifs", "erofs",
+];
 
+/// Определяет, является ли запись реальным хранилищем.
+/// В LXC device может быть "rpool/data/subvol-102-disk-0" (ZFS) или "overlay".
+pub fn is_real_storage(device: &str, fs_type: &str, include_overlay: bool) -> bool {
+    if device.starts_with("/dev/") {
+        return true;
+    }
+    if REAL_FS_TYPES.contains(&fs_type) {
+        return true;
+    }
+    include_overlay && fs_type == "overlay"
+}
+
+/// Парсинг /proc/mounts БЕЗ фильтрации (все валидные строки)
+pub fn parse_proc_mounts_all(content: &str) -> Vec<MountEntry> {
+    let mut entries = Vec::new();
     for line in content.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() < 4 {
             continue;
         }
-
-        let device = parts[0];
-        let mount_point = parts[1];
-        let fs_type = parts[2];
-
-        // Только реальные блочные устройства
-        if !device.starts_with("/dev/") {
-            continue;
-        }
-
         entries.push(MountEntry {
-            device: device.to_string(),
-            mount_point: mount_point.to_string(),
-            fs_type: fs_type.to_string(),
+            device: parts[0].to_string(),
+            mount_point: parts[1].to_string(),
+            fs_type: parts[2].to_string(),
         });
     }
-
     entries
+}
+
+/// Прежняя функция (обратная совместимость тестов): только /dev/*
+pub fn parse_proc_mounts(content: &str) -> Vec<MountEntry> {
+    parse_proc_mounts_all(content)
+        .into_iter()
+        .filter(|e| e.device.starts_with("/dev/"))
+        .collect()
 }
 
 /// Полный сбор метрик: парсинг + фильтрация по config + statvfs
 pub fn collect_fs_metrics(config: &FilesystemConfig) -> Vec<FsMetrics> {
     let mut metrics = Vec::new();
     let mounts = fs::read_to_string("/proc/mounts").unwrap_or_default();
-    let entries = parse_proc_mounts(&mounts);
+    let entries = parse_proc_mounts_all(&mounts);
+    let mut seen_devs: HashSet<u64> = HashSet::new();
 
     for entry in entries {
+        // Фильтр: реальное хранилище (включая ZFS/overlay/NFS в LXC)
+        if !is_real_storage(&entry.device, &entry.fs_type, config.include_overlay) {
+            continue;
+        }
+
         // Фильтр: игнорировать определённые типы ФС (из конфига)
         if config.ignore_fs_types.iter().any(|t| t == &entry.fs_type) {
             continue;
@@ -83,6 +104,14 @@ pub fn collect_fs_metrics(config: &FilesystemConfig) -> Vec<FsMetrics> {
             .any(|mp| entry.mount_point.starts_with(mp.as_str()))
         {
             continue;
+        }
+
+        // Дедупликация bind-mount'ов одной ФС по st_dev,
+        // чтобы sum by (host_name) в дашборде не задваивал объёмы
+        if let Ok(meta) = fs::metadata(&entry.mount_point) {
+            if !seen_devs.insert(meta.st_dev()) {
+                continue;
+            }
         }
 
         let stat = match statvfs(Path::new(&entry.mount_point)) {

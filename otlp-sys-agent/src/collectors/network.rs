@@ -1,11 +1,9 @@
-// src/collectors/network.rs
-
 use crate::collector::Collector;
 use crate::config::NetworkConfig;
 use anyhow::Result;
 use async_trait::async_trait;
 use nix::ifaddrs::getifaddrs;
-use opentelemetry::metrics::Meter;
+use opentelemetry::metrics::{Counter, Gauge, Meter};
 use opentelemetry::KeyValue;
 use std::collections::HashMap;
 use std::fs;
@@ -13,7 +11,6 @@ use std::net::Ipv6Addr;
 use std::path::Path;
 use tracing::{debug, warn};
 
-/// Полная информация о сетевом интерфейсе
 #[derive(Debug, Clone)]
 pub struct NetworkInterfaceInfo {
     pub name: String,
@@ -21,12 +18,11 @@ pub struct NetworkInterfaceInfo {
     pub speed_mbps: Option<u64>,
     pub duplex: Option<String>,
     pub operstate: String,
-    pub flags: u32,          // <-- ДОБАВЛЕНО
+    pub flags: u32,
     pub ipv4: Vec<String>,
     pub ipv6: Vec<String>,
 }
 
-/// I/O статистика интерфейса
 #[derive(Debug, Clone, Default, Copy)]
 pub struct NetworkIoStats {
     pub rx_bytes: u64,
@@ -39,20 +35,10 @@ pub struct NetworkIoStats {
     pub tx_dropped: u64,
 }
 
-// ==============================
-// ЧИСТЫЕ ФУНКЦИИ ПАРСИНГА (для юнит-тестов)
-// ==============================
-
-/// Парсит MAC-адрес, нормализуя регистр и убирая trailing newline
 pub fn parse_mac(raw: &str) -> String {
     raw.trim().to_lowercase()
 }
 
-/// Парсит скорость из sysfs. Возвращает None, если:
-/// - файл недоступен (интерфейс down, виртуальный)
-/// - значение невалидно
-/// - значение == -1 (нет линка)
-/// - значение == 4294961 (магическое значение для virtio без линка)
 pub fn parse_speed_mbps(raw: &str) -> Option<u64> {
     let s = raw.trim();
     let v = s.parse::<i64>().ok()?;
@@ -62,7 +48,6 @@ pub fn parse_speed_mbps(raw: &str) -> Option<u64> {
     Some(v as u64)
 }
 
-/// Парсит duplex из sysfs
 pub fn parse_duplex(raw: &str) -> Option<String> {
     let s = raw.trim();
     if s.is_empty() || s == "unknown" {
@@ -72,7 +57,6 @@ pub fn parse_duplex(raw: &str) -> Option<String> {
     }
 }
 
-/// Парсит operstate из sysfs
 pub fn parse_operstate(raw: &str) -> String {
     let s = raw.trim();
     if s.is_empty() {
@@ -82,39 +66,24 @@ pub fn parse_operstate(raw: &str) -> String {
     }
 }
 
-/// Парсит hex-флаги интерфейса из sysfs.
-/// Пример: "0x11091" -> 0x11091
 pub fn parse_interface_flags(raw: &str) -> u32 {
     let s = raw.trim();
     let s = s.strip_prefix("0x").unwrap_or(s);
     u32::from_str_radix(s, 16).unwrap_or(0)
 }
 
-/// Определяет, UP ли интерфейс, по operstate и флагам.
-///
-/// Логика:
-/// - operstate == "up" → UP
-/// - operstate == "down" → DOWN
-/// - operstate == "unknown" → проверяем флаг IFF_UP (0x1)
-///   (PPP, bridge и другие интерфейсы без carrier detection)
 pub fn is_interface_up(operstate: &str, flags: u32) -> bool {
     match operstate {
         "up" => true,
         "down" => false,
-        _ => {
-            // IFF_UP = 0x1
-            (flags & 0x1) != 0
-        }
+        _ => (flags & 0x1) != 0,
     }
 }
 
-/// Фильтр интерфейсов
 pub fn should_skip_interface(name: &str, config: &NetworkConfig) -> bool {
-    // Точные совпадения
     if config.ignore_exact.contains(&name.to_string()) {
         return true;
     }
-    // По префиксам
     for prefix in &config.ignore_interfaces {
         if name.starts_with(prefix) || name == prefix {
             return true;
@@ -123,7 +92,6 @@ pub fn should_skip_interface(name: &str, config: &NetworkConfig) -> bool {
     false
 }
 
-/// Парсит sysfs-статистику из содержимого директории statistics/
 pub fn parse_statistics(stats: &HashMap<String, String>) -> NetworkIoStats {
     let get = |key: &str| -> u64 {
         stats.get(key).and_then(|v| v.trim().parse().ok()).unwrap_or(0)
@@ -141,16 +109,10 @@ pub fn parse_statistics(stats: &HashMap<String, String>) -> NetworkIoStats {
     }
 }
 
-// ==============================
-// ФУНКЦИИ ЧТЕНИЯ СИСТЕМНЫХ ДАННЫХ
-// ==============================
-
-/// Утилита: чтение строки из sysfs-файла
 fn read_sys_str(path: &Path) -> Option<String> {
     fs::read_to_string(path).ok().map(|s| s.trim().to_string())
 }
 
-/// Собирает map {имя_интерфейса -> (Vec<IPv4>, Vec<IPv6>)}
 fn collect_ip_addresses() -> HashMap<String, (Vec<String>, Vec<String>)> {
     let mut map: HashMap<String, (Vec<String>, Vec<String>)> = HashMap::new();
 
@@ -167,20 +129,13 @@ fn collect_ip_addresses() -> HashMap<String, (Vec<String>, Vec<String>)> {
         let entry = map.entry(name).or_insert_with(|| (Vec::new(), Vec::new()));
 
         if let Some(addr) = ifaddr.address {
-            // addr имеет тип nix::sys::socket::SockaddrStorage
-
-            // Пытаемся получить IPv4
             if let Some(ipv4) = addr.as_sockaddr_in() {
-                let ip = ipv4.ip(); // возвращает std::net::Ipv4Addr
-                // Пропускаем link-local (169.254.0.0/16)
+                let ip = ipv4.ip();
                 if !ip.is_link_local() {
                     entry.0.push(ip.to_string());
                 }
-            }
-            // Пытаемся получить IPv6
-            else if let Some(ipv6) = addr.as_sockaddr_in6() {
-                let ip = ipv6.ip(); // возвращает std::net::Ipv6Addr
-                // Пропускаем link-local (fe80::)
+            } else if let Some(ipv6) = addr.as_sockaddr_in6() {
+                let ip = ipv6.ip();
                 if !is_ipv6_link_local(&ip) {
                     entry.1.push(ip.to_string());
                 }
@@ -196,7 +151,6 @@ fn is_ipv6_link_local(ip: &Ipv6Addr) -> bool {
     (seg[0] & 0xffc0) == 0xfe80
 }
 
-/// Читает sysfs-статистику из директории /sys/class/net/<iface>/statistics/
 fn read_interface_statistics(iface_path: &Path) -> NetworkIoStats {
     let stats_dir = iface_path.join("statistics");
     let mut map = HashMap::new();
@@ -217,7 +171,6 @@ fn read_interface_statistics(iface_path: &Path) -> NetworkIoStats {
     parse_statistics(&map)
 }
 
-/// Основная функция: сбор информации о всех физических сетевых интерфейсах
 pub fn collect_network_info(config: &NetworkConfig) -> Vec<NetworkInterfaceInfo> {
     let mut interfaces = Vec::new();
     let net_path = Path::new("/sys/class/net");
@@ -245,30 +198,24 @@ pub fn collect_network_info(config: &NetworkConfig) -> Vec<NetworkInterfaceInfo>
 
         let iface_path = entry.path();
 
-        // MAC
         let mac = read_sys_str(&iface_path.join("address"))
             .map(|s| parse_mac(&s))
             .unwrap_or_default();
 
-        // Speed (может отсутствовать для виртуальных и down-интерфейсов)
         let speed_mbps = read_sys_str(&iface_path.join("speed"))
             .and_then(|s| parse_speed_mbps(&s));
 
-        // Duplex
         let duplex = read_sys_str(&iface_path.join("duplex"))
             .and_then(|s| parse_duplex(&s));
 
-        // Operstate
         let operstate = read_sys_str(&iface_path.join("operstate"))
             .map(|s| parse_operstate(&s))
             .unwrap_or_else(|| "unknown".to_string());
 
-        // Flags (для определения UP на PPP и других интерфейсах с operstate=unknown)
         let flags = read_sys_str(&iface_path.join("flags"))
             .map(|s| parse_interface_flags(&s))
             .unwrap_or(0);
 
-        // IP адреса
         let (ipv4, ipv6) = ip_map
             .get(&name)
             .cloned()
@@ -280,18 +227,16 @@ pub fn collect_network_info(config: &NetworkConfig) -> Vec<NetworkInterfaceInfo>
             speed_mbps,
             duplex,
             operstate,
-            flags,       // <-- ДОБАВЛЕНО
+            flags,
             ipv4,
             ipv6,
         });
     }
 
-    // Сортируем для стабильного порядка метрик
     interfaces.sort_by(|a, b| a.name.cmp(&b.name));
     interfaces
 }
 
-/// Сбор I/O статистики для всех интерфейсов (без фильтрации)
 pub fn collect_network_io_stats(config: &NetworkConfig) -> HashMap<String, NetworkIoStats> {
     let mut stats = HashMap::new();
     let net_path = Path::new("/sys/class/net");
@@ -315,18 +260,83 @@ pub fn collect_network_io_stats(config: &NetworkConfig) -> HashMap<String, Netwo
     stats
 }
 
-// ==============================
-// COLLECTOR IMPLEMENTATION
-// ==============================
+pub struct NetworkMetrics {
+    info: Gauge<f64>,
+    up: Gauge<f64>,
+    rx_bytes: Counter<u64>,
+    tx_bytes: Counter<u64>,
+    rx_packets: Counter<u64>,
+    tx_packets: Counter<u64>,
+    rx_errors: Counter<u64>,
+    tx_errors: Counter<u64>,
+    rx_dropped: Counter<u64>,
+    tx_dropped: Counter<u64>,
+}
+
+impl NetworkMetrics {
+    pub fn new(meter: &Meter) -> Self {
+        Self {
+            info: meter
+                .f64_gauge("system.network.info")
+                .with_description("Network interface metadata (always 1)")
+                .with_unit("1")
+                .build(),
+            up: meter
+                .f64_gauge("system.network.up")
+                .with_description("Network interface operational status (1=up, 0=down)")
+                .with_unit("1")
+                .build(),
+            rx_bytes: meter
+                .u64_counter("system.network.io.rx_bytes")
+                .with_description("Total bytes received on interface")
+                .with_unit("By")
+                .build(),
+            tx_bytes: meter
+                .u64_counter("system.network.io.tx_bytes")
+                .with_description("Total bytes transmitted from interface")
+                .with_unit("By")
+                .build(),
+            rx_packets: meter
+                .u64_counter("system.network.io.rx_packets")
+                .with_description("Total packets received on interface")
+                .build(),
+            tx_packets: meter
+                .u64_counter("system.network.io.tx_packets")
+                .with_description("Total packets transmitted from interface")
+                .build(),
+            rx_errors: meter
+                .u64_counter("system.network.io.rx_errors")
+                .with_description("Total receive errors on interface")
+                .build(),
+            tx_errors: meter
+                .u64_counter("system.network.io.tx_errors")
+                .with_description("Total transmit errors on interface")
+                .build(),
+            rx_dropped: meter
+                .u64_counter("system.network.io.rx_dropped")
+                .with_description("Total packets dropped on receive")
+                .build(),
+            tx_dropped: meter
+                .u64_counter("system.network.io.tx_dropped")
+                .with_description("Total packets dropped on transmit")
+                .build(),
+        }
+    }
+}
 
 pub struct NetworkCollector {
     hostname: String,
     config: NetworkConfig,
+    metrics: NetworkMetrics,
 }
 
 impl NetworkCollector {
-    pub fn new(config: NetworkConfig, hostname: String) -> Self {
-        Self { config, hostname }
+    pub fn new(config: NetworkConfig, hostname: String, meter: &Meter) -> Self {
+        Self {
+            config,
+            hostname,
+            metrics: NetworkMetrics::new(meter),
+        }
     }
 }
 
@@ -336,19 +346,11 @@ impl Collector for NetworkCollector {
         "network"
     }
 
-    async fn collect(&self, meter: &Meter) -> Result<()> {
+    async fn collect(&self, _meter: &Meter) -> Result<()> {
         let interfaces = collect_network_info(&self.config);
         let io_stats = collect_network_io_stats(&self.config);
 
-        // ── 1. Информационная метрика (аналог node_network_info) ──
-        let info_gauge = meter
-            .f64_gauge("system.network.info")
-            .with_description("Network interface metadata (always 1)")
-            .with_unit("1")
-            .build();
-
         for iface in &interfaces {
-            // Объединяем IP адреса через запятую (Prometheus label может содержать строки)
             let ipv4_str = if iface.ipv4.is_empty() {
                 "none".to_string()
             } else {
@@ -380,7 +382,7 @@ impl Collector for NetworkCollector {
                 KeyValue::new("ipv6", ipv6_str),
             ];
 
-            info_gauge.record(1.0, &attrs);
+            self.metrics.info.record(1.0, &attrs);
 
             debug!(
                 interface = %iface.name,
@@ -392,65 +394,14 @@ impl Collector for NetworkCollector {
             );
         }
 
-        // ── 2. Статус интерфейса (up=1, down=0) ──
-        let up_gauge = meter
-            .f64_gauge("system.network.up")
-            .with_description("Network interface operational status (1=up, 0=down)")
-            .with_unit("1")
-            .build();
-
         for iface in &interfaces {
             let attrs = [
                 KeyValue::new("host_name", self.hostname.clone()),
                 KeyValue::new("interface", iface.name.clone()),
             ];
-            // ✅ Теперь используем комбинированную проверку operstate + flags
             let value: f64 = if is_interface_up(&iface.operstate, iface.flags) { 1.0 } else { 0.0 };
-            up_gauge.record(value, &attrs);
+            self.metrics.up.record(value, &attrs);
         }
-
-        // ── 3. I/O статистика (cumulative counters) ──
-        let rx_bytes_counter = meter
-            .u64_counter("system.network.io.rx_bytes")
-            .with_description("Total bytes received on interface")
-            .with_unit("By")
-            .build();
-
-        let tx_bytes_counter = meter
-            .u64_counter("system.network.io.tx_bytes")
-            .with_description("Total bytes transmitted from interface")
-            .with_unit("By")
-            .build();
-
-        let rx_packets_counter = meter
-            .u64_counter("system.network.io.rx_packets")
-            .with_description("Total packets received on interface")
-            .build();
-
-        let tx_packets_counter = meter
-            .u64_counter("system.network.io.tx_packets")
-            .with_description("Total packets transmitted from interface")
-            .build();
-
-        let rx_errors_counter = meter
-            .u64_counter("system.network.io.rx_errors")
-            .with_description("Total receive errors on interface")
-            .build();
-
-        let tx_errors_counter = meter
-            .u64_counter("system.network.io.tx_errors")
-            .with_description("Total transmit errors on interface")
-            .build();
-
-        let rx_dropped_counter = meter
-            .u64_counter("system.network.io.rx_dropped")
-            .with_description("Total packets dropped on receive")
-            .build();
-
-        let tx_dropped_counter = meter
-            .u64_counter("system.network.io.tx_dropped")
-            .with_description("Total packets dropped on transmit")
-            .build();
 
         for (iface_name, io) in &io_stats {
             let attrs = [
@@ -458,14 +409,14 @@ impl Collector for NetworkCollector {
                 KeyValue::new("interface", iface_name.clone()),
             ];
 
-            rx_bytes_counter.add(io.rx_bytes, &attrs);
-            tx_bytes_counter.add(io.tx_bytes, &attrs);
-            rx_packets_counter.add(io.rx_packets, &attrs);
-            tx_packets_counter.add(io.tx_packets, &attrs);
-            rx_errors_counter.add(io.rx_errors, &attrs);
-            tx_errors_counter.add(io.tx_errors, &attrs);
-            rx_dropped_counter.add(io.rx_dropped, &attrs);
-            tx_dropped_counter.add(io.tx_dropped, &attrs);
+            self.metrics.rx_bytes.add(io.rx_bytes, &attrs);
+            self.metrics.tx_bytes.add(io.tx_bytes, &attrs);
+            self.metrics.rx_packets.add(io.rx_packets, &attrs);
+            self.metrics.tx_packets.add(io.tx_packets, &attrs);
+            self.metrics.rx_errors.add(io.rx_errors, &attrs);
+            self.metrics.tx_errors.add(io.tx_errors, &attrs);
+            self.metrics.rx_dropped.add(io.rx_dropped, &attrs);
+            self.metrics.tx_dropped.add(io.tx_dropped, &attrs);
         }
 
         Ok(())

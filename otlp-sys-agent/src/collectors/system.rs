@@ -1,16 +1,12 @@
-// src/collectors/system.rs
-
 use crate::collector::Collector;
 use anyhow::Result;
 use async_trait::async_trait;
-use opentelemetry::metrics::Meter;
+use opentelemetry::metrics::{Gauge, Meter};
 use opentelemetry::KeyValue;
 use std::collections::HashMap;
 use std::fs;
 use std::sync::Mutex;
-// ❌ УБРАНО: use tracing::warn;   (не используется)
 
-/// Информация о CPU из /proc/cpuinfo
 #[derive(Debug, Clone)]
 pub struct CpuInfo {
     pub model: String,
@@ -18,8 +14,6 @@ pub struct CpuInfo {
     pub threads: u64,
 }
 
-/// Состояние CPU из /proc/stat (для расчёта загрузки)
-/// ✅ СДЕЛАНО pub + поля pub для доступа из тестов
 #[derive(Debug, Clone, Default, Copy)]
 pub struct CpuStatState {
     pub user: u64,
@@ -33,19 +27,16 @@ pub struct CpuStatState {
 }
 
 impl CpuStatState {
-    /// Суммарное время всех состояний CPU
     pub fn total(&self) -> u64 {
         self.user + self.nice + self.system + self.idle
             + self.iowait + self.irq + self.softirq + self.steal
     }
 
-    /// Время, когда CPU был занят (всё кроме idle и iowait)
     pub fn busy(&self) -> u64 {
         self.user + self.nice + self.system + self.irq + self.softirq + self.steal
     }
 }
 
-/// Информация о памяти из /proc/meminfo
 #[derive(Debug, Clone)]
 pub struct MemoryInfo {
     pub total_bytes: u64,
@@ -55,10 +46,6 @@ pub struct MemoryInfo {
     pub buffers_bytes: u64,
     pub cached_bytes: u64,
 }
-
-// ==============================
-// ЧИСТЫЕ ФУНКЦИИ ПАРСИНГА
-// ==============================
 
 pub fn parse_cpuinfo(content: &str) -> CpuInfo {
     let mut model = String::from("unknown");
@@ -153,21 +140,63 @@ pub fn calculate_cpu_usage(prev: &CpuStatState, cur: &CpuStatState) -> f64 {
     (busy_delta as f64 / total_delta as f64) * 100.0
 }
 
-// ==============================
-// COLLECTOR IMPLEMENTATION
-// (остальная часть без изменений)
-// ==============================
+pub struct SystemMetrics {
+    cpu_info: Gauge<f64>,
+    cpu_usage: Gauge<f64>,
+    mem_total: Gauge<u64>,
+    mem_used: Gauge<u64>,
+    mem_available: Gauge<u64>,
+    mem_free: Gauge<u64>,
+}
+
+impl SystemMetrics {
+    pub fn new(meter: &Meter) -> Self {
+        Self {
+            cpu_info: meter
+                .f64_gauge("system.cpu.info")
+                .with_description("CPU metadata (always 1)")
+                .build(),
+            cpu_usage: meter
+                .f64_gauge("system.cpu.usage")
+                .with_description("CPU usage percentage (0-100)")
+                .with_unit("%")
+                .build(),
+            mem_total: meter
+                .u64_gauge("system.memory.total_bytes")
+                .with_description("Total system memory in bytes")
+                .with_unit("By")
+                .build(),
+            mem_used: meter
+                .u64_gauge("system.memory.used_bytes")
+                .with_description("Used system memory in bytes")
+                .with_unit("By")
+                .build(),
+            mem_available: meter
+                .u64_gauge("system.memory.available_bytes")
+                .with_description("Available system memory in bytes")
+                .with_unit("By")
+                .build(),
+            mem_free: meter
+                .u64_gauge("system.memory.free_bytes")
+                .with_description("Free system memory in bytes")
+                .with_unit("By")
+                .build(),
+        }
+    }
+}
 
 pub struct SystemCollector {
     hostname: String,
     prev_cpu_stat: Mutex<CpuStatState>,
+    metrics: SystemMetrics,
 }
 
 impl SystemCollector {
-    pub fn new(hostname: String) -> Self {
+    pub fn new(hostname: String, meter: &Meter) -> Self {
         Self {
             hostname,
             prev_cpu_stat: Mutex::new(CpuStatState::default()),
+            metrics: SystemMetrics::new(meter),
         }
     }
 }
@@ -178,69 +207,37 @@ impl Collector for SystemCollector {
         "system"
     }
 
-    async fn collect(&self, meter: &Meter) -> Result<()> {
+    async fn collect(&self, _meter: &Meter) -> Result<()> {
         let base_attrs = [KeyValue::new("host_name", self.hostname.clone())];
 
         // CPU Info
         let cpuinfo_content = fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
         let cpu_info = parse_cpuinfo(&cpuinfo_content);
 
-        let cpu_info_gauge = meter
-            .f64_gauge("system.cpu.info")
-            .with_description("CPU metadata (always 1)")
-            .build();
-
         let cpu_info_attrs = [
             KeyValue::new("host_name", self.hostname.clone()),
             KeyValue::new("cpu_model", cpu_info.model.clone()),
             KeyValue::new("cpu_threads", cpu_info.threads.to_string()),
         ];
-        cpu_info_gauge.record(1.0, &cpu_info_attrs);
+        self.metrics.cpu_info.record(1.0, &cpu_info_attrs);
 
         // CPU Usage
         let stat_content = fs::read_to_string("/proc/stat").unwrap_or_default();
         let cur_stat = parse_proc_stat(&stat_content);
 
-        let cpu_usage_gauge = meter
-            .f64_gauge("system.cpu.usage")
-            .with_description("CPU usage percentage (0-100)")
-            .with_unit("%")
-            .build();
-
         let mut prev_stat = self.prev_cpu_stat.lock().unwrap();
         let usage = calculate_cpu_usage(&prev_stat, &cur_stat);
-        cpu_usage_gauge.record(usage, &base_attrs);
+        self.metrics.cpu_usage.record(usage, &base_attrs);
         *prev_stat = cur_stat;
 
         // Memory
         let meminfo_content = fs::read_to_string("/proc/meminfo").unwrap_or_default();
         let mem = parse_meminfo(&meminfo_content);
 
-        let mem_total_gauge = meter
-            .u64_gauge("system.memory.total_bytes")
-            .with_description("Total system memory in bytes")
-            .with_unit("By")
-            .build();
-        let mem_used_gauge = meter
-            .u64_gauge("system.memory.used_bytes")
-            .with_description("Used system memory in bytes")
-            .with_unit("By")
-            .build();
-        let mem_available_gauge = meter
-            .u64_gauge("system.memory.available_bytes")
-            .with_description("Available system memory in bytes")
-            .with_unit("By")
-            .build();
-        let mem_free_gauge = meter
-            .u64_gauge("system.memory.free_bytes")
-            .with_description("Free system memory in bytes")
-            .with_unit("By")
-            .build();
-
-        mem_total_gauge.record(mem.total_bytes, &base_attrs);
-        mem_used_gauge.record(mem.used_bytes, &base_attrs);
-        mem_available_gauge.record(mem.available_bytes, &base_attrs);
-        mem_free_gauge.record(mem.free_bytes, &base_attrs);
+        self.metrics.mem_total.record(mem.total_bytes, &base_attrs);
+        self.metrics.mem_used.record(mem.used_bytes, &base_attrs);
+        self.metrics.mem_available.record(mem.available_bytes, &base_attrs);
+        self.metrics.mem_free.record(mem.free_bytes, &base_attrs);
 
         Ok(())
     }

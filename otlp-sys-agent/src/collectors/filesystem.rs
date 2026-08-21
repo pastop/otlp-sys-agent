@@ -1,11 +1,9 @@
-// src/collectors/filesystem.rs
-
 use crate::collector::Collector;
 use crate::config::FilesystemConfig;
 use anyhow::Result;
 use async_trait::async_trait;
 use nix::sys::statvfs::{statvfs, FsFlags};
-use opentelemetry::metrics::Meter;
+use opentelemetry::metrics::{Gauge, Meter};
 use opentelemetry::KeyValue;
 use std::collections::HashSet;
 use std::fs;
@@ -27,7 +25,6 @@ pub struct FsMetrics {
     pub is_read_only: bool,
 }
 
-/// Запись из /proc/mounts
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MountEntry {
     pub device: String,
@@ -35,15 +32,11 @@ pub struct MountEntry {
     pub fs_type: String,
 }
 
-/// Типы ФС, которые считаем реальным хранилищем,
-/// даже если device не начинается с /dev/ (типично для LXC: ZFS, NFS и т.д.)
 const REAL_FS_TYPES: &[&str] = &[
     "ext2", "ext3", "ext4", "xfs", "btrfs", "zfs", "f2fs", "reiserfs",
     "jfs", "vfat", "exfat", "ntfs", "ntfs3", "nfs", "nfs4", "cifs", "erofs",
 ];
 
-/// Определяет, является ли запись реальным хранилищем.
-/// В LXC device может быть "rpool/data/subvol-102-disk-0" (ZFS) или "overlay".
 pub fn is_real_storage(device: &str, fs_type: &str, include_overlay: bool) -> bool {
     if device.starts_with("/dev/") {
         return true;
@@ -54,7 +47,6 @@ pub fn is_real_storage(device: &str, fs_type: &str, include_overlay: bool) -> bo
     include_overlay && fs_type == "overlay"
 }
 
-/// Парсинг /proc/mounts БЕЗ фильтрации (все валидные строки)
 pub fn parse_proc_mounts_all(content: &str) -> Vec<MountEntry> {
     let mut entries = Vec::new();
     for line in content.lines() {
@@ -71,7 +63,6 @@ pub fn parse_proc_mounts_all(content: &str) -> Vec<MountEntry> {
     entries
 }
 
-/// Прежняя функция (обратная совместимость тестов): только /dev/*
 pub fn parse_proc_mounts(content: &str) -> Vec<MountEntry> {
     parse_proc_mounts_all(content)
         .into_iter()
@@ -79,7 +70,6 @@ pub fn parse_proc_mounts(content: &str) -> Vec<MountEntry> {
         .collect()
 }
 
-/// Полный сбор метрик: парсинг + фильтрация по config + statvfs
 pub fn collect_fs_metrics(config: &FilesystemConfig) -> Vec<FsMetrics> {
     let mut metrics = Vec::new();
     let mounts = fs::read_to_string("/proc/mounts").unwrap_or_default();
@@ -87,17 +77,14 @@ pub fn collect_fs_metrics(config: &FilesystemConfig) -> Vec<FsMetrics> {
     let mut seen_devs: HashSet<u64> = HashSet::new();
 
     for entry in entries {
-        // Фильтр: реальное хранилище (включая ZFS/overlay/NFS в LXC)
         if !is_real_storage(&entry.device, &entry.fs_type, config.include_overlay) {
             continue;
         }
 
-        // Фильтр: игнорировать определённые типы ФС (из конфига)
         if config.ignore_fs_types.iter().any(|t| t == &entry.fs_type) {
             continue;
         }
 
-        // Фильтр: игнорировать определённые точки монтирования (из конфига)
         if config
             .ignore_mount_points
             .iter()
@@ -106,8 +93,6 @@ pub fn collect_fs_metrics(config: &FilesystemConfig) -> Vec<FsMetrics> {
             continue;
         }
 
-        // Дедупликация bind-mount'ов одной ФС по st_dev,
-        // чтобы sum by (host_name) в дашборде не задваивал объёмы
         if let Ok(meta) = fs::metadata(&entry.mount_point) {
             if !seen_devs.insert(meta.st_dev()) {
                 continue;
@@ -151,18 +136,63 @@ pub fn collect_fs_metrics(config: &FilesystemConfig) -> Vec<FsMetrics> {
     metrics
 }
 
-// ========================
-// COLLECTOR IMPLEMENTATION
-// ========================
+pub struct FilesystemMetrics {
+    total_bytes: Gauge<u64>,
+    used_bytes: Gauge<u64>,
+    free_bytes: Gauge<u64>,
+    reserved_bytes: Gauge<u64>,
+    inodes_total: Gauge<u64>,
+    inodes_free: Gauge<u64>,
+}
+
+impl FilesystemMetrics {
+    pub fn new(meter: &Meter) -> Self {
+        Self {
+            total_bytes: meter
+                .u64_gauge("system.filesystem.total_bytes")
+                .with_description("Total filesystem size in bytes")
+                .with_unit("By")
+                .build(),
+            used_bytes: meter
+                .u64_gauge("system.filesystem.used_bytes")
+                .with_description("Used filesystem space in bytes")
+                .with_unit("By")
+                .build(),
+            free_bytes: meter
+                .u64_gauge("system.filesystem.free_bytes")
+                .with_description("Free filesystem space available to non-root users")
+                .with_unit("By")
+                .build(),
+            reserved_bytes: meter
+                .u64_gauge("system.filesystem.reserved_bytes")
+                .with_description("Reserved filesystem space (root-only blocks)")
+                .with_unit("By")
+                .build(),
+            inodes_total: meter
+                .u64_gauge("system.filesystem.inodes_total")
+                .with_description("Total number of filesystem inodes")
+                .build(),
+            inodes_free: meter
+                .u64_gauge("system.filesystem.inodes_free")
+                .with_description("Number of free filesystem inodes")
+                .build(),
+        }
+    }
+}
 
 pub struct FilesystemCollector {
     hostname: String,
     config: FilesystemConfig,
+    metrics: FilesystemMetrics,
 }
 
 impl FilesystemCollector {
-    pub fn new(config: FilesystemConfig, hostname: String) -> Self {
-        Self { config, hostname }
+    pub fn new(config: FilesystemConfig, hostname: String, meter: &Meter) -> Self {
+        Self {
+            config,
+            hostname,
+            metrics: FilesystemMetrics::new(meter),
+        }
     }
 }
 
@@ -172,42 +202,8 @@ impl Collector for FilesystemCollector {
         "filesystem"
     }
 
-    async fn collect(&self, meter: &Meter) -> Result<()> {
+    async fn collect(&self, _meter: &Meter) -> Result<()> {
         let fs_metrics = collect_fs_metrics(&self.config);
-
-        let total_gauge = meter
-            .u64_gauge("system.filesystem.total_bytes")
-            .with_description("Total filesystem size in bytes")
-            .with_unit("By")
-            .build();
-
-        let used_gauge = meter
-            .u64_gauge("system.filesystem.used_bytes")
-            .with_description("Used filesystem space in bytes")
-            .with_unit("By")
-            .build();
-
-        let free_gauge = meter
-            .u64_gauge("system.filesystem.free_bytes")
-            .with_description("Free filesystem space available to non-root users")
-            .with_unit("By")
-            .build();
-
-        let reserved_gauge = meter
-            .u64_gauge("system.filesystem.reserved_bytes")
-            .with_description("Reserved filesystem space (root-only blocks)")
-            .with_unit("By")
-            .build();
-
-        let inodes_total_gauge = meter
-            .u64_gauge("system.filesystem.inodes_total")
-            .with_description("Total number of filesystem inodes")
-            .build();
-
-        let inodes_free_gauge = meter
-            .u64_gauge("system.filesystem.inodes_free")
-            .with_description("Number of free filesystem inodes")
-            .build();
 
         for fs in &fs_metrics {
             let attrs = [
@@ -217,12 +213,12 @@ impl Collector for FilesystemCollector {
                 KeyValue::new("fstype", fs.fs_type.clone()),
             ];
 
-            total_gauge.record(fs.total_bytes, &attrs);
-            used_gauge.record(fs.used_bytes, &attrs);
-            free_gauge.record(fs.free_bytes, &attrs);
-            reserved_gauge.record(fs.reserved_bytes, &attrs);
-            inodes_total_gauge.record(fs.inodes_total, &attrs);
-            inodes_free_gauge.record(fs.inodes_free, &attrs);
+            self.metrics.total_bytes.record(fs.total_bytes, &attrs);
+            self.metrics.used_bytes.record(fs.used_bytes, &attrs);
+            self.metrics.free_bytes.record(fs.free_bytes, &attrs);
+            self.metrics.reserved_bytes.record(fs.reserved_bytes, &attrs);
+            self.metrics.inodes_total.record(fs.inodes_total, &attrs);
+            self.metrics.inodes_free.record(fs.inodes_free, &attrs);
 
             debug!(
                 device = %fs.device,

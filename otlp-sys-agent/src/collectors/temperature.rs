@@ -1,7 +1,7 @@
 use crate::collector::Collector;
 use anyhow::Result;
 use async_trait::async_trait;
-use opentelemetry::metrics::Meter;
+use opentelemetry::metrics::{Gauge, Meter};
 use opentelemetry::KeyValue;
 use std::fs;
 use std::path::Path;
@@ -14,14 +14,33 @@ pub struct TempReadout {
     pub celsius: f64,
 }
 
+pub struct SysfsTempMetrics {
+    temperature_celsius: Gauge<f64>,
+}
+
+impl SysfsTempMetrics {
+    pub fn new(meter: &Meter) -> Self {
+        Self {
+            temperature_celsius: meter
+                .f64_gauge("system.hardware.temperature.celsius")
+                .with_description("Temperature readout from system hardware sensors")
+                .with_unit("Cel")
+                .build(),
+        }
+    }
+}
+
 pub struct SysfsTempCollector {
     hostname: String,
+    metrics: SysfsTempMetrics,
 }
 
 impl SysfsTempCollector {
-
-    pub fn new(hostname: String) -> Self {
-        Self { hostname }
+    pub fn new(hostname: String, meter: &Meter) -> Self {
+        Self {
+            hostname,
+            metrics: SysfsTempMetrics::new(meter),
+        }
     }
 
     pub fn read_temperatures() -> Vec<TempReadout> {
@@ -87,14 +106,7 @@ impl Collector for SysfsTempCollector {
         "temperature"
     }
 
-    async fn collect(&self, meter: &Meter) -> Result<()> {
-        // Создаем метрику типа Gauge
-        let gauge = meter
-            .f64_gauge("system.hardware.temperature.celsius")
-            .with_description("Temperature readout from system hardware sensors")
-            .with_unit("Cel")
-            .build();
-
+    async fn collect(&self, _meter: &Meter) -> Result<()> {
         let temps = Self::read_temperatures();
         for temp in temps {
             debug!(
@@ -104,8 +116,7 @@ impl Collector for SysfsTempCollector {
                 "Отправка показаний температуры"
             );
 
-            // Фиксируем значение с метками чипа и сенсора
-            gauge.record(
+            self.metrics.temperature_celsius.record(
                 temp.celsius,
                 &[
                     KeyValue::new("host_name", self.hostname.clone()),

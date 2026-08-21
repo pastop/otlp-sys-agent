@@ -1,10 +1,8 @@
-// src/collectors/disk.rs
-
 use crate::collector::Collector;
 use crate::config::DiskConfig;
 use anyhow::Result;
 use async_trait::async_trait;
-use opentelemetry::metrics::Meter;
+use opentelemetry::metrics::{Counter, Gauge, Meter};
 use opentelemetry::KeyValue;
 use std::collections::HashMap;
 use std::fs;
@@ -12,26 +10,17 @@ use std::path::Path;
 use std::sync::Mutex;
 use tracing::{debug, warn};
 
-/// Информация о физическом диске и его разделах
 #[derive(Debug, Clone)]
 pub struct DiskInfo {
-    /// Имя устройства: sda, nvme0n1, vda
     pub device: String,
-    /// Модель диска из /sys/block/<dev>/device/model
     pub model: String,
-    /// Общий размер диска в байтах
     pub total_bytes: u64,
-    /// SSD (false) или HDD (true)
     pub rotational: bool,
-    /// Съёмное устройство (USB-флешки и т.п.)
     pub removable: bool,
-    /// Список разделов: (имя, размер в байтах)
     pub partitions: Vec<(String, u64)>,
-    /// Неразмеченное пространство (разница между размером диска и суммой разделов)
     pub unallocated_bytes: u64,
 }
 
-/// I/O статистика диска из /sys/block/<dev>/stat
 #[derive(Debug, Clone, Default, Copy)]
 pub struct DiskIoStats {
     pub reads_completed: u64,
@@ -42,7 +31,6 @@ pub struct DiskIoStats {
     pub io_in_progress: u64,
 }
 
-/// Предыдущее состояние I/O для расчёта дельт
 #[derive(Debug, Clone, Default, Copy)]
 struct DiskIoPrevState {
     reads_completed: u64,
@@ -52,20 +40,6 @@ struct DiskIoPrevState {
     io_time_ms: u64,
 }
 
-// ==============================
-// ЧИСТЫЕ ФУНКЦИИ ПАРСИНГА (для юнит-тестов)
-// ==============================
-
-/// Чистая функция парсинга содержимого /proc/partitions.
-/// Возвращает map {имя_устройства -> размер в байтах}.
-///
-/// Формат /proc/partitions:
-/// ```text
-///  major minor  #blocks  name
-///    8        0  976762584 sda
-///    8        1  974761984 sda1
-/// ```
-/// Размер указан в блоках по 1024 байта.
 pub fn parse_proc_partitions(content: &str) -> HashMap<String, u64> {
     let mut map = HashMap::new();
 
@@ -81,9 +55,6 @@ pub fn parse_proc_partitions(content: &str) -> HashMap<String, u64> {
     map
 }
 
-/// Находит все разделы, принадлежащие конкретному диску.
-/// Для sda: ищет sda1, sda2, ...
-/// Для nvme0n1: ищет nvme0n1p1, nvme0n1p2, ...
 pub fn find_partitions(
     disk_name: &str,
     partitions_map: &HashMap<String, u64>,
@@ -109,14 +80,11 @@ pub fn find_partitions(
     result
 }
 
-/// Расчёт неразмеченного пространства:
-/// unallocated = total_bytes - сумма размеров всех разделов
 pub fn calculate_unallocated(total_bytes: u64, partitions: &[(String, u64)]) -> u64 {
     let allocated: u64 = partitions.iter().map(|(_, size)| size).sum();
     total_bytes.saturating_sub(allocated)
 }
 
-/// Фильтр устройств для игнорирования
 pub fn should_skip_device(device_name: &str, config: &DiskConfig) -> bool {
     if device_name.starts_with("loop")
         || device_name.starts_with("ram")
@@ -137,11 +105,6 @@ pub fn should_skip_device(device_name: &str, config: &DiskConfig) -> bool {
     false
 }
 
-// ==============================
-// ФУНКЦИИ ЧТЕНИЯ СИСТЕМНЫХ ДАННЫХ
-// ==============================
-
-/// Читает /proc/partitions и возвращает map {имя -> размер в байтах}
 fn read_proc_partitions() -> HashMap<String, u64> {
     match fs::read_to_string("/proc/partitions") {
         Ok(content) => parse_proc_partitions(&content),
@@ -149,18 +112,12 @@ fn read_proc_partitions() -> HashMap<String, u64> {
     }
 }
 
-/// Утилита: чтение u64 из sysfs-файла
 fn read_sys_u64(path: &Path) -> Option<u64> {
     fs::read_to_string(path)
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
 }
 
-// ==============================
-// СБОР ИНФОРМАЦИИ О ДИСКАХ
-// ==============================
-
-/// Основная функция: собирает информацию о всех физических дисках
 pub fn collect_disk_info(config: &DiskConfig) -> Vec<DiskInfo> {
     let partitions_map = read_proc_partitions();
     let mut disks = Vec::new();
@@ -183,7 +140,6 @@ pub fn collect_disk_info(config: &DiskConfig) -> Vec<DiskInfo> {
 
         let dev_path = entry.path();
 
-        // 1. Размер диска в секторах (по 512 байт)
         let total_bytes = match read_sys_u64(&dev_path.join("size")) {
             Some(sectors) => sectors * 512,
             None => continue,
@@ -193,7 +149,6 @@ pub fn collect_disk_info(config: &DiskConfig) -> Vec<DiskInfo> {
             continue;
         }
 
-        // 2. Модель диска
         let model = fs::read_to_string(dev_path.join("device/model"))
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|_| {
@@ -202,20 +157,15 @@ pub fn collect_disk_info(config: &DiskConfig) -> Vec<DiskInfo> {
                     .unwrap_or_else(|_| "unknown".to_string())
             });
 
-        // 3. SSD или HDD
         let rotational = read_sys_u64(&dev_path.join("queue/rotational"))
             .map(|v| v == 1)
             .unwrap_or(false);
 
-        // 4. Съёмное устройство
         let removable = read_sys_u64(&dev_path.join("removable"))
             .map(|v| v == 1)
             .unwrap_or(false);
 
-        // 5. Найти все разделы этого диска
         let disk_partitions = find_partitions(&device_name, &partitions_map);
-
-        // 6. Рассчитать неразмеченное пространство
         let unallocated_bytes = calculate_unallocated(total_bytes, &disk_partitions);
 
         disks.push(DiskInfo {
@@ -232,11 +182,6 @@ pub fn collect_disk_info(config: &DiskConfig) -> Vec<DiskInfo> {
     disks
 }
 
-/// Чтение I/O статистики из /sys/block/<dev>/stat
-/// Формат (11+ полей):
-/// reads_completed reads_merged sectors_read read_time_ms
-/// writes_completed writes_merged sectors_written write_time_ms
-/// io_in_progress io_time_ms weighted_io_time_ms ...
 pub fn collect_disk_io_stats(config: &DiskConfig) -> HashMap<String, DiskIoStats> {
     let mut stats = HashMap::new();
     let sys_block_path = Path::new("/sys/block");
@@ -249,7 +194,6 @@ pub fn collect_disk_io_stats(config: &DiskConfig) -> HashMap<String, DiskIoStats
     for entry in entries.flatten() {
         let device_name = entry.file_name().to_string_lossy().to_string();
 
-        // Фильтруем устройства сразу при сборе
         if should_skip_device(&device_name, config) {
             continue;
         }
@@ -288,22 +232,81 @@ pub fn collect_disk_io_stats(config: &DiskConfig) -> HashMap<String, DiskIoStats
     stats
 }
 
-// ==============================
-// COLLECTOR IMPLEMENTATION
-// ==============================
+pub struct DiskMetrics {
+    total_bytes: Gauge<u64>,
+    unallocated_bytes: Gauge<u64>,
+    partition_size_bytes: Gauge<u64>,
+    read_bytes: Counter<u64>,
+    write_bytes: Counter<u64>,
+    reads_completed: Counter<u64>,
+    writes_completed: Counter<u64>,
+    io_time_ms: Counter<u64>,
+    io_in_progress: Gauge<u64>,
+}
+
+impl DiskMetrics {
+    pub fn new(meter: &Meter) -> Self {
+        Self {
+            total_bytes: meter
+                .u64_gauge("system.disk.total_bytes")
+                .with_description("Total size of physical disk in bytes")
+                .with_unit("By")
+                .build(),
+            unallocated_bytes: meter
+                .u64_gauge("system.disk.unallocated_bytes")
+                .with_description("Unallocated (free) space on physical disk")
+                .with_unit("By")
+                .build(),
+            partition_size_bytes: meter
+                .u64_gauge("system.disk.partition_size_bytes")
+                .with_description("Size of disk partition in bytes")
+                .with_unit("By")
+                .build(),
+            read_bytes: meter
+                .u64_counter("system.disk.io.read_bytes")
+                .with_description("Bytes read from disk")
+                .with_unit("By")
+                .build(),
+            write_bytes: meter
+                .u64_counter("system.disk.io.write_bytes")
+                .with_description("Bytes written to disk")
+                .with_unit("By")
+                .build(),
+            reads_completed: meter
+                .u64_counter("system.disk.io.reads_completed")
+                .with_description("Number of completed read operations")
+                .build(),
+            writes_completed: meter
+                .u64_counter("system.disk.io.writes_completed")
+                .with_description("Number of completed write operations")
+                .build(),
+            io_time_ms: meter
+                .u64_counter("system.disk.io.io_time_ms")
+                .with_description("Time spent doing I/Os in milliseconds")
+                .with_unit("ms")
+                .build(),
+            io_in_progress: meter
+                .u64_gauge("system.disk.io.in_progress")
+                .with_description("Number of I/Os currently in progress")
+                .build(),
+        }
+    }
+}
 
 pub struct DiskCollector {
     hostname: String,
     config: DiskConfig,
     prev_io: Mutex<HashMap<String, DiskIoPrevState>>,
+    metrics: DiskMetrics,
 }
 
 impl DiskCollector {
-    pub fn new(config: DiskConfig, hostname: String) -> Self {
+    pub fn new(config: DiskConfig, hostname: String, meter: &Meter) -> Self {
         Self {
             config,
             hostname,
             prev_io: Mutex::new(HashMap::new()),
+            metrics: DiskMetrics::new(meter),
         }
     }
 }
@@ -314,27 +317,8 @@ impl Collector for DiskCollector {
         "disk"
     }
 
-    async fn collect(&self, meter: &Meter) -> Result<()> {
-        // ── 1. Информация о дисках ──
+    async fn collect(&self, _meter: &Meter) -> Result<()> {
         let disks = collect_disk_info(&self.config);
-
-        let total_gauge = meter
-            .u64_gauge("system.disk.total_bytes")
-            .with_description("Total size of physical disk in bytes")
-            .with_unit("By")
-            .build();
-
-        let unallocated_gauge = meter
-            .u64_gauge("system.disk.unallocated_bytes")
-            .with_description("Unallocated (free) space on physical disk")
-            .with_unit("By")
-            .build();
-
-        let partition_gauge = meter
-            .u64_gauge("system.disk.partition_size_bytes")
-            .with_description("Size of disk partition in bytes")
-            .with_unit("By")
-            .build();
 
         for disk in &disks {
             let base_attrs = [
@@ -345,8 +329,8 @@ impl Collector for DiskCollector {
                 KeyValue::new("removable", disk.removable),
             ];
 
-            total_gauge.record(disk.total_bytes, &base_attrs);
-            unallocated_gauge.record(disk.unallocated_bytes, &base_attrs);
+            self.metrics.total_bytes.record(disk.total_bytes, &base_attrs);
+            self.metrics.unallocated_bytes.record(disk.unallocated_bytes, &base_attrs);
 
             for (part_name, part_size) in &disk.partitions {
                 let part_attrs = [
@@ -354,7 +338,7 @@ impl Collector for DiskCollector {
                     KeyValue::new("device", disk.device.clone()),
                     KeyValue::new("partition", part_name.clone()),
                 ];
-                partition_gauge.record(*part_size, &part_attrs);
+                self.metrics.partition_size_bytes.record(*part_size, &part_attrs);
             }
 
             debug!(
@@ -367,46 +351,11 @@ impl Collector for DiskCollector {
             );
         }
 
-        // ── 2. I/O статистика дисков ──
         if !self.config.collect_io {
             return Ok(());
         }
 
         let io_stats = collect_disk_io_stats(&self.config);
-
-        let read_counter = meter
-            .u64_counter("system.disk.io.read_bytes")
-            .with_description("Bytes read from disk")
-            .with_unit("By")
-            .build();
-
-        let write_counter = meter
-            .u64_counter("system.disk.io.write_bytes")
-            .with_description("Bytes written to disk")
-            .with_unit("By")
-            .build();
-
-        let reads_counter = meter
-            .u64_counter("system.disk.io.reads_completed")
-            .with_description("Number of completed read operations")
-            .build();
-
-        let writes_counter = meter
-            .u64_counter("system.disk.io.writes_completed")
-            .with_description("Number of completed write operations")
-            .build();
-
-        let io_time_counter = meter
-            .u64_counter("system.disk.io.io_time_ms")
-            .with_description("Time spent doing I/Os in milliseconds")
-            .with_unit("ms")
-            .build();
-
-        let io_in_progress_gauge = meter
-            .u64_gauge("system.disk.io.in_progress")
-            .with_description("Number of I/Os currently in progress")
-            .build();
-
         let mut prev_map = self.prev_io.lock().unwrap();
         let mut next_map = HashMap::new();
 
@@ -419,30 +368,21 @@ impl Collector for DiskCollector {
             let cur_read_sectors = io.read_bytes / 512;
             let cur_write_sectors = io.write_bytes / 512;
 
-            let has_prev = prev_map.contains_key(device);
+            if let Some(prev) = prev_map.get(device) {
+                let delta_read_bytes = cur_read_sectors.saturating_sub(prev.read_sectors) * 512;
+                let delta_write_bytes = cur_write_sectors.saturating_sub(prev.write_sectors) * 512;
+                let delta_reads = io.reads_completed.saturating_sub(prev.reads_completed);
+                let delta_writes = io.writes_completed.saturating_sub(prev.writes_completed);
+                let delta_io_time = io.io_time_ms.saturating_sub(prev.io_time_ms);
 
-            if has_prev {
-                let prev = prev_map[device];
-
-                let delta_read_bytes =
-                    cur_read_sectors.saturating_sub(prev.read_sectors) * 512;
-                let delta_write_bytes =
-                    cur_write_sectors.saturating_sub(prev.write_sectors) * 512;
-                let delta_reads =
-                    io.reads_completed.saturating_sub(prev.reads_completed);
-                let delta_writes =
-                    io.writes_completed.saturating_sub(prev.writes_completed);
-                let delta_io_time =
-                    io.io_time_ms.saturating_sub(prev.io_time_ms);
-
-                read_counter.add(delta_read_bytes, &attrs);
-                write_counter.add(delta_write_bytes, &attrs);
-                reads_counter.add(delta_reads, &attrs);
-                writes_counter.add(delta_writes, &attrs);
-                io_time_counter.add(delta_io_time, &attrs);
+                self.metrics.read_bytes.add(delta_read_bytes, &attrs);
+                self.metrics.write_bytes.add(delta_write_bytes, &attrs);
+                self.metrics.reads_completed.add(delta_reads, &attrs);
+                self.metrics.writes_completed.add(delta_writes, &attrs);
+                self.metrics.io_time_ms.add(delta_io_time, &attrs);
             }
 
-            io_in_progress_gauge.record(io.io_in_progress, &attrs);
+            self.metrics.io_in_progress.record(io.io_in_progress, &attrs);
 
             next_map.insert(
                 device.clone(),

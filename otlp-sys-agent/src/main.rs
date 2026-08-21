@@ -11,6 +11,7 @@ use otlp_sys_agent::collectors::temperature::SysfsTempCollector;
 
 use otlp_sys_agent::config::AppConfig;
 use otlp_sys_agent::telemetry;
+use std::env;
 use std::time::Duration;
 use tokio::signal;
 use tracing::{info, warn};
@@ -18,6 +19,13 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Обработка флагов версии (-v, --version)
+    let args: Vec<String> = env::args().collect();
+    if args.iter().any(|arg| arg == "-v" || arg == "--version") {
+        println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     // 1. Загрузка конфигурации
     let cfg = AppConfig::load()?;
 
@@ -30,6 +38,7 @@ async fn main() -> Result<()> {
         .init();
 
     info!(
+        version = env!("CARGO_PKG_VERSION"),
         hostname = %cfg.get_hostname(),
         endpoint = %cfg.otlp.endpoint,
         interval = cfg.agent.interval_secs,
@@ -45,7 +54,7 @@ async fn main() -> Result<()> {
     let mut registry = CollectorRegistry::new();
 
     if cfg.collectors.temperature.enabled {
-        registry.register(SysfsTempCollector::new(hostname.clone()));
+        registry.register(SysfsTempCollector::new(hostname.clone(), &meter));
     }
 
     // Регистрация iptables коллектора
@@ -61,16 +70,12 @@ async fn main() -> Result<()> {
         registry.register(ProcessCollector::new(hostname.clone(), &meter));
     }
 
-    if registry.is_empty() {
-        warn!("Нет активных коллекторов в конфигурации! Завершение работы.");
-        return Ok(());
-    }
-
     // Регистрация filesystem коллектора
     if cfg.collectors.filesystem.enabled {
         registry.register(FilesystemCollector::new(
             cfg.collectors.filesystem.clone(),
             hostname.clone(),
+            &meter,
         ));
     }
 
@@ -79,6 +84,7 @@ async fn main() -> Result<()> {
         registry.register(DiskCollector::new(
             cfg.collectors.disk.clone(),
             hostname.clone(),
+            &meter,
         ));
     }
 
@@ -87,11 +93,17 @@ async fn main() -> Result<()> {
         registry.register(NetworkCollector::new(
             cfg.collectors.network.clone(),
             hostname.clone(),
+            &meter,
         ));
     }
 
     // Регистрация System коллектора
-    registry.register(SystemCollector::new(hostname.clone()));
+    registry.register(SystemCollector::new(hostname.clone(), &meter));
+
+    if registry.is_empty() {
+        warn!("Нет активных коллекторов в конфигурации! Завершение работы.");
+        return Ok(());
+    }
 
     // 5. Главный асинхронный цикл сбора
     let mut ticker = tokio::time::interval(Duration::from_secs(cfg.agent.interval_secs));

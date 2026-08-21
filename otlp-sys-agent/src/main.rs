@@ -1,13 +1,13 @@
 use anyhow::Result;
 use opentelemetry::metrics::MeterProvider;
 use otlp_sys_agent::collector::CollectorRegistry;
-use otlp_sys_agent::collectors::iptables::IptablesCollector;
-use otlp_sys_agent::collectors::process::ProcessCollector;
-use otlp_sys_agent::collectors::temperature::SysfsTempCollector;
-use otlp_sys_agent::collectors::filesystem::FilesystemCollector;
 use otlp_sys_agent::collectors::disk::DiskCollector;
+use otlp_sys_agent::collectors::filesystem::FilesystemCollector;
+use otlp_sys_agent::collectors::iptables::IptablesCollector;
 use otlp_sys_agent::collectors::network::NetworkCollector;
+use otlp_sys_agent::collectors::process::ProcessCollector;
 use otlp_sys_agent::collectors::system::SystemCollector;
+use otlp_sys_agent::collectors::temperature::SysfsTempCollector;
 
 use otlp_sys_agent::config::AppConfig;
 use otlp_sys_agent::telemetry;
@@ -58,7 +58,7 @@ async fn main() -> Result<()> {
 
     // Регистрация process коллектора
     if cfg.collectors.process.enabled {
-        registry.register(ProcessCollector::new(hostname.clone()));
+        registry.register(ProcessCollector::new(hostname.clone(), &meter));
     }
 
     if registry.is_empty() {

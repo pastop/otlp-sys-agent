@@ -1,3 +1,6 @@
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use anyhow::Result;
 use opentelemetry::metrics::MeterProvider;
 use otlp_sys_agent::collector::CollectorRegistry;
